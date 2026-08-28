@@ -2663,3 +2663,28 @@ func BenchmarkRuleEvalWithRemovedRules(b *testing.B) {
 		waf.Rules.Eval(types.PhaseRequestHeaders, tx)
 	}
 }
+
+func TestBytePresenceCacheUsesStringIdentityAndReleasesValues(t *testing.T) {
+	waf := NewWAF()
+	tx := waf.NewTransaction()
+	first := strings.Clone(strings.Repeat("x", 1024))
+	second := strings.Clone(first)
+	present := [4]uint64{1, 2, 3, 4}
+
+	tx.StoreBytePresence(first, present)
+	if cached, found := tx.LoadBytePresence(first); !found || *cached != present {
+		t.Fatalf("unexpected cached byte presence: found %v, value %v", found, cached)
+	}
+	if _, found := tx.LoadBytePresence(second); found {
+		t.Fatal("equal content with different storage must not alias the identity cache")
+	}
+
+	if err := tx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range tx.bytePresenceCache {
+		if entry.value != "" {
+			t.Fatal("closing a pooled transaction must release cached input strings")
+		}
+	}
+}

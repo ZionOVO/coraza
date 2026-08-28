@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/corazawaf/coraza/v3/collection"
 	"github.com/corazawaf/coraza/v3/debuglog"
@@ -137,6 +138,36 @@ type Transaction struct {
 	variables TransactionVariables
 
 	transformationCache map[transformationKey]transformationValue
+
+	bytePresenceCache [4]bytePresenceCacheEntry
+	bytePresenceNext  uint8
+}
+
+type bytePresenceCacheEntry struct {
+	value   string
+	present [4]uint64
+}
+
+// LoadBytePresence returns the cached byte-presence bitmap for the exact input
+// string. The cache is transaction-local because operators in one transaction
+// repeatedly inspect the same request-body value.
+func (tx *Transaction) LoadBytePresence(value string) (*[4]uint64, bool) {
+	for index := range tx.bytePresenceCache {
+		entry := &tx.bytePresenceCache[index]
+		if len(entry.value) == len(value) && len(value) != 0 && unsafe.StringData(entry.value) == unsafe.StringData(value) {
+			return &entry.present, true
+		}
+	}
+	return nil, false
+}
+
+// StoreBytePresence caches a byte-presence bitmap for the exact input string.
+// A fixed-size ring bounds retained request data and avoids per-request maps.
+func (tx *Transaction) StoreBytePresence(value string, present [4]uint64) {
+	entry := &tx.bytePresenceCache[tx.bytePresenceNext]
+	entry.value = value
+	entry.present = present
+	tx.bytePresenceNext = (tx.bytePresenceNext + 1) % uint8(len(tx.bytePresenceCache))
 }
 
 func (tx *Transaction) ID() string {
@@ -650,25 +681,26 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 		matches = col.FindAll()
 	}
 
-	// in the most common scenario filteredMatches length will be
-	// the same as matches length, so we avoid allocating per result.
-	// We reuse the matches slice to store filtered results avoiding extra allocation.
-	filteredCount := 0
-	for _, c := range matches {
-		isException := false
-		lkey := strings.ToLower(c.Key())
-		for _, ex := range rv.Exceptions {
-			if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey || (ex.KeyStr == "" && ex.KeyRx == nil) {
-				isException = true
-				break
+	if len(rv.Exceptions) != 0 {
+		// In the most common filtered scenario matches keeps the same length, so
+		// reuse its backing array instead of allocating a second result slice.
+		filteredCount := 0
+		for _, c := range matches {
+			isException := false
+			lkey := strings.ToLower(c.Key())
+			for _, ex := range rv.Exceptions {
+				if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey || (ex.KeyStr == "" && ex.KeyRx == nil) {
+					isException = true
+					break
+				}
+			}
+			if !isException {
+				matches[filteredCount] = c
+				filteredCount++
 			}
 		}
-		if !isException {
-			matches[filteredCount] = c
-			filteredCount++
-		}
+		matches = matches[:filteredCount]
 	}
-	matches = matches[:filteredCount]
 
 	if rv.Count {
 		count := len(matches)
@@ -1687,6 +1719,10 @@ func (tx *Transaction) Close() error {
 	}
 
 	tx.variables.reset()
+	for index := range tx.bytePresenceCache {
+		tx.bytePresenceCache[index] = bytePresenceCacheEntry{}
+	}
+	tx.bytePresenceNext = 0
 	if err := tx.requestBodyBuffer.Reset(); err != nil {
 		errs = append(errs, fmt.Errorf("reseting request body buffer: %v", err))
 	}

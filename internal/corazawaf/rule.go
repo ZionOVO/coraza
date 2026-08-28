@@ -254,7 +254,7 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 			var argsLen int
 			for i, arg := range values {
 				if r.MultiMatch {
-					args, errs = r.transformMultiMatchArg(arg)
+					args, errs = r.executeTransformationsMultimatch(arg.Value())
 					argsLen = len(args)
 				} else {
 					args[0], errs = r.transformArg(arg, i, cache)
@@ -402,13 +402,6 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 		}
 	}
 	return matchedValues
-}
-
-func (r *Rule) transformMultiMatchArg(arg types.MatchData) ([]string, []error) {
-	// TODOs:
-	// - We don't need to run every transformation. We could try for each until found
-	// - Cache is not used for multimatch
-	return r.executeTransformationsMultimatch(arg.Value())
 }
 
 func (r *Rule) transformArg(arg types.MatchData, argIdx int, cache map[transformationKey]transformationValue) (string, []error) {

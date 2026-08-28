@@ -7,6 +7,7 @@ package operators
 
 import (
 	"strings"
+	"unsafe"
 
 	ahocorasick "github.com/petar-dambovaliev/aho-corasick"
 
@@ -33,7 +34,13 @@ import (
 // SecRule ARGS "@pm <script> javascript: onerror=" "id:171,deny"
 // ```
 type pm struct {
-	matcher ahocorasick.AhoCorasick
+	matcher      ahocorasick.AhoCorasick
+	nonCapturing *indexedMatcher
+}
+
+type pmCompiled struct {
+	matcher      ahocorasick.AhoCorasick
+	nonCapturing *indexedMatcher
 }
 
 var _ plugintypes.Operator = (*pm)(nil)
@@ -50,17 +57,46 @@ func newPM(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 		DFA:                  true,
 	})
 
-	m, _ := memoizeDo(options.Memoizer, data, func() (any, error) { return builder.Build(dict), nil })
+	cacheKey := "pm:" + data
+	compiled, _ := memoizeDo(options.Memoizer, cacheKey, func() (any, error) {
+		artifact := &pmCompiled{matcher: builder.Build(dict)}
+		if !anyEmpty(dict) {
+			artifact.nonCapturing = newIndexedMatcher(dict, true)
+		}
+		return artifact, nil
+	})
 	// TODO this operator is supposed to support snort data syntax: "@pm A|42|C|44|F"
-	return &pm{matcher: m.(ahocorasick.AhoCorasick)}, nil
+	artifact := compiled.(*pmCompiled)
+	return &pm{matcher: artifact.matcher, nonCapturing: artifact.nonCapturing}, nil
 }
 
 func (o *pm) Evaluate(tx plugintypes.TransactionState, value string) bool {
+	if o.nonCapturing != nil {
+		if !o.nonCapturing.matchWithState(tx, value) {
+			return false
+		}
+		if !tx.Capturing() {
+			return true
+		}
+	}
 	return pmEvaluate(o.matcher, tx, value)
 }
 
+func anyEmpty(values []string) bool {
+	for _, value := range values {
+		if value == "" {
+			return true
+		}
+	}
+	return false
+}
+
 func pmEvaluate(matcher ahocorasick.AhoCorasick, tx plugintypes.TransactionState, value string) bool {
-	iter := matcher.Iter(value)
+	// Aho-Corasick stores the haystack in its iterator, so Iter converts the
+	// complete string to a copied byte slice. The matcher never mutates the
+	// haystack; a read-only view avoids copying large request bodies per rule.
+	valueBytes := unsafe.Slice(unsafe.StringData(value), len(value))
+	iter := matcher.IterByte(valueBytes)
 
 	if !tx.Capturing() {
 		// Not capturing so just one match is enough.

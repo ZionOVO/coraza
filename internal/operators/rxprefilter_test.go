@@ -5,7 +5,9 @@ package operators
 
 import (
 	"fmt"
+	"math/rand"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 	"testing"
 
@@ -88,16 +90,16 @@ func TestPrefilterFuncBuildability(t *testing.T) {
 		noMatch string // input that the regex does not match (checked when prefilter is non-nil)
 	}{
 		{"hello", false, "plain literal", "say hello", "goodbye"},
-		{"[a-z]+", true, "char class only", "", ""},
+		{"[a-z]+", false, "small character class", "letters", "12345"},
 		{"hello.*world", false, "literals around wildcard", "hello big world", "goodbye planet"},
 		{"(ab|cd)", false, "alternation with literals", "xabx", "xyz"},
 		{".*", true, "pure wildcard", "", ""},
-		{"\\d+", true, "digit class", "", ""},
+		{"\\d+", false, "digit class", "12345", "letters"},
 		{"sleep\\s*\\(", false, "literal with optional whitespace", "sleep(1)", "wake(1)"},
 		{"(?:union\\s+select|insert\\s+into)", false, "CRS-style alternation", "union select 1", "update set x"},
 		{".", true, "single any-char", "", ""},
 		{"(a|.)", true, "alternation with wildcard branch", "", ""},
-		{"(?:ab|[0-9]+)", true, "alternation where one branch has no literal", "", ""},
+		{"(?:ab|[0-9]+)", false, "literal and character class alternation", "123", "xyz"},
 		{"(abc)+", false, "repeated literal", "xabcabc", "xyzxyz"},
 		{"(abc)?", true, "optional group", "", ""},
 		{"(abc)*", true, "zero-or-more group", "", ""},
@@ -606,6 +608,34 @@ func TestContainsFoldASCII(t *testing.T) {
 				t.Errorf("containsFoldASCII(%q, %q) = %v, want %v", tc.s, tc.needle, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFoldedLiteralMatcherMatchesReferenceSearch(t *testing.T) {
+	random := rand.New(rand.NewSource(42))
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-/"
+	for _, needle := range []string{"select", "request", "javascript", "x", "ab", "content-type"} {
+		matcher := newFoldedLiteralMatcher(needle)
+		for iteration := 0; iteration < 5000; iteration++ {
+			value := make([]byte, random.Intn(512))
+			for index := range value {
+				value[index] = alphabet[random.Intn(len(alphabet))]
+			}
+			if len(needle) <= len(value) && random.Intn(2) == 0 {
+				start := random.Intn(len(value) - len(needle) + 1)
+				copy(value[start:], needle)
+				for index := start; index < start+len(needle); index++ {
+					if value[index] >= 'a' && value[index] <= 'z' && random.Intn(2) == 0 {
+						value[index] -= 'a' - 'A'
+					}
+				}
+			}
+			text := string(value)
+			want := containsFoldASCIIOnly(text, needle)
+			if have := matcher.match(text); have != want {
+				t.Fatalf("needle %q, input %q: want %v, have %v", needle, text, want, have)
+			}
+		}
 	}
 }
 
@@ -1149,11 +1179,8 @@ func TestPrefilterEdgeCases(t *testing.T) {
 	}
 }
 
-// TestAnyRequiredNeverFiltered verifies that the anyRequired path uses
-// anyTooShort (fail-safe) instead of filterShort (silently remove). If any
-// alternation branch produces a short literal, the prefilter should be nil
-// (no prefilter) rather than checking only the longer alternatives, which
-// would risk false negatives.
+// TestAnyRequiredNeverFiltered verifies that short alternation branches stay
+// in the prefilter instead of being silently removed.
 func TestAnyRequiredNeverFiltered(t *testing.T) {
 	// Pattern (é|hello) — é is a single rune but 2 bytes in UTF-8.
 	// Both branches should produce usable literals. The prefilter should
@@ -1174,18 +1201,16 @@ func TestAnyRequiredNeverFiltered(t *testing.T) {
 		}
 	})
 
-	// Verify that anyTooShort correctly detects short elements
+	// Only empty alternatives force a bail-out; one-byte alternatives remain
+	// useful when combined with larger assembled-rule dictionaries.
 	t.Run("anyTooShort_function", func(t *testing.T) {
-		if anyTooShort([]string{"ab", "cd", "ef"}, 2) {
-			t.Error("expected false for all >= 2")
+		if anyTooShort([]string{"a", "cd", "ef"}, 1) {
+			t.Error("expected false for all non-empty literals")
 		}
-		if !anyTooShort([]string{"ab", "c", "ef"}, 2) {
-			t.Error("expected true when one element is < 2")
-		}
-		if !anyTooShort([]string{"", "ab"}, 2) {
+		if !anyTooShort([]string{"", "ab"}, 1) {
 			t.Error("expected true for empty element")
 		}
-		if anyTooShort([]string{}, 2) {
+		if anyTooShort([]string{}, 1) {
 			t.Error("expected false for empty slice")
 		}
 	})
@@ -1506,14 +1531,13 @@ func TestExtractLiteralsRuneError(t *testing.T) {
 	}
 }
 
-// TestPrefilterAllRequiredFilteredToEmpty covers the case where allRequired
-// literals are all too short after filtering (< 2 bytes).
-func TestPrefilterAllRequiredFilteredToEmpty(t *testing.T) {
-	// Pattern: a single-char literal concatenated with a wildcard — "a.*"
-	// extractLiterals yields allRequired{"a"}, filterShort removes it → nil.
+func TestPrefilterAllRequiredRetainsSingleByteLiteral(t *testing.T) {
 	pf := prefilterFunc("(?s)a.*")
-	if pf != nil {
-		t.Error("prefilterFunc should return nil when all literals are too short")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a required one-byte literal")
+	}
+	if !pf("abc") || pf("zzz") {
+		t.Error("unexpected one-byte required-literal result")
 	}
 }
 
@@ -1657,6 +1681,21 @@ func TestExtractLiteralsOpConcatAnyRequiredChild(t *testing.T) {
 	}
 }
 
+func TestExtractLiteralsOpConcatRetainsBestAlternative(t *testing.T) {
+	pf := prefilterFunc("(?s)(?:alpha|bravo).*(?:select|union|insert)")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a required alternative from concatenation")
+	}
+	for _, input := range []string{"alpha then select", "bravo then union", "alpha then insert"} {
+		if !pf(input) {
+			t.Errorf("expected a possible match for %q", input)
+		}
+	}
+	if pf("charlie then select") {
+		t.Error("expected the retained alternatives to reject the input")
+	}
+}
+
 // TestExtractLiteralsOpAlternateNilBranch covers OpAlternate where one branch
 // has no extractable literal (lines 360-362).
 func TestExtractLiteralsOpAlternateNilBranch(t *testing.T) {
@@ -1725,48 +1764,68 @@ func TestAllASCIIStringsNonASCII(t *testing.T) {
 	}
 }
 
-// TestPrefilterAnyTooShortBailout covers the anyTooShort bail-out (lines 222-223).
-func TestPrefilterAnyTooShortBailout(t *testing.T) {
-	// Pattern: (a|hello) — 'a' is 1 byte < 2, so anyTooShort triggers bail-out.
+func TestPrefilterAnyRequiredRetainsSingleByteAlternatives(t *testing.T) {
 	pf := prefilterFunc("(?s)(?:a|hello)")
-	if pf != nil {
-		t.Error("prefilterFunc should return nil when anyRequired has too-short elements")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain one-byte alternatives")
+	}
+	for _, value := range []string{"a", "hello"} {
+		if !pf(value) {
+			t.Errorf("expected a possible match for %q", value)
+		}
+	}
+	if pf("zzzzz") {
+		t.Error("expected unrelated input to be rejected")
 	}
 }
 
-// TestPrefilterPfNilGuard covers the pf == nil guard (lines 261-263).
-// This happens when lits is a type we don't handle (shouldn't happen in practice,
-// but the guard exists). We can trigger it if extractLiterals returns an
-// unexpected type — but since we control the types, we test via patterns where
-// the switch cases don't set pf (e.g., extractLiterals returns allRequired but
-// all get filtered out).
-func TestPrefilterPfNilGuard(t *testing.T) {
-	// This is already covered by TestPrefilterAllRequiredFilteredToEmpty above,
-	// but we also test with a pattern that reaches the switch but no case matches.
-	// In practice, lits is always allRequired or anyRequired, so the nil guard
-	// is only reached when filtering removes everything.
+func TestPrefilterRetainsSmallCharacterClassAlternatives(t *testing.T) {
+	pattern := `(?i)(?:[;={}]+|select|union)`
+	pf := prefilterFunc(pattern)
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a small character class")
+	}
+	for _, value := range []string{";", "name=value", "SELECT", "union"} {
+		if !pf(value) {
+			t.Errorf("expected a possible match for %q", value)
+		}
+	}
+	if pf(strings.Repeat("x", 64<<10)) {
+		t.Error("expected a large unrelated body to be rejected")
+	}
+}
 
-	// Pattern with only 1-char literals: "a.*b" → allRequired{"a","b"} → filtered to empty.
+func TestPrefilterAllRequiredSelectsOneNecessaryShortLiteral(t *testing.T) {
 	pf := prefilterFunc("(?s)a.*b")
-	if pf != nil {
-		t.Error("prefilterFunc should return nil when all allRequired literals too short")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a necessary short literal")
+	}
+	if !pf("axb") || pf("zzz") {
+		t.Error("unexpected short-literal filter result")
 	}
 }
 
-// TestPrefilterCaseInsensitiveWithNonASCIIInput covers the isASCII guard wrapper
-// for CI patterns with non-ASCII input (lines 275-282).
+// TestPrefilterCaseInsensitiveWithNonASCIIInput covers the Unicode simple-fold
+// exceptions that can make an ASCII literal match non-ASCII input.
 func TestPrefilterCaseInsensitiveWithNonASCIIInput(t *testing.T) {
 	pf := prefilterFunc("(?si)hello")
 	if pf == nil {
 		t.Fatal("prefilterFunc should return non-nil for (?i)hello")
 	}
-	// Non-ASCII input: should conservatively return true (maybe match).
-	if !pf("héllo") {
-		t.Error("expected true for non-ASCII input with CI pattern (conservative)")
+	if pf("héllo") {
+		t.Error("expected unrelated non-ASCII input to be rejected")
 	}
-	// ASCII input without match: should return false.
 	if pf("goodbye") {
 		t.Error("expected false for 'goodbye'")
+	}
+
+	longS := prefilterFunc("(?si)select")
+	if longS == nil || !longS("ſelect") {
+		t.Error("expected long s to preserve a possible Unicode-fold match")
+	}
+	kelvin := prefilterFunc("(?si)key")
+	if kelvin == nil || !kelvin("Key") {
+		t.Error("expected Kelvin sign to preserve a possible Unicode-fold match")
 	}
 }
 
@@ -1846,5 +1905,202 @@ func BenchmarkRxPrefilter(b *testing.B) {
 				re.MatchString(bm.input)
 			}
 		})
+	}
+}
+
+func TestExtractExactMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		literal string
+		fold    bool
+	}{
+		{name: "anchored literal", pattern: `^Upload$`, literal: "Upload"},
+		{name: "case insensitive literal", pattern: `(?i)^Upload$`, literal: "UPLOAD", fold: true},
+		{name: "absolute anchors", pattern: `\Avalue\z`, literal: "value"},
+		{name: "unanchored", pattern: `value`},
+		{name: "non literal", pattern: `^value.*$`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := syntax.Parse(test.pattern, syntax.Perl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			literal, fold := extractExactMatch(parsed.Simplify())
+			if literal != test.literal || fold != test.fold {
+				t.Fatalf("unexpected exact match: want (%q, %v), have (%q, %v)", test.literal, test.fold, literal, fold)
+			}
+		})
+	}
+}
+
+func TestExactMatchPreservesCaptures(t *testing.T) {
+	operator, err := newRX(plugintypes.OperatorOptions{
+		Arguments:          `^Upload$`,
+		RxPreFilterEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waf := corazawaf.NewWAF()
+	tx := waf.NewTransaction()
+	t.Cleanup(func() {
+		if err := tx.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	tx.Capture = true
+	if !operator.Evaluate(tx, "Upload") {
+		t.Fatal("expected exact expression to match")
+	}
+	captured := tx.Variables().TX().Get("0")
+	if len(captured) != 1 || captured[0] != "Upload" {
+		t.Fatalf("expected full-match capture, have %v", captured)
+	}
+}
+
+func TestCaseInsensitiveUnicodeLiteralsBypassBytePrefilter(t *testing.T) {
+	for _, pattern := range []string{`(?i)é`, `(?i)Σ`} {
+		if filter := compilePrefilter(pattern); filter.match != nil || filter.matchWithState != nil {
+			t.Errorf("Unicode-folded pattern %q must use the regular-expression backend", pattern)
+		}
+	}
+}
+
+func TestIndexedMatcherMatchesNaiveSearch(t *testing.T) {
+	patternSets := [][]string{
+		{"union", "select", "insert"},
+		{"ab", "longer-pattern", "xyz"},
+		{"script", "javascript", "onerror", "document.cookie"},
+	}
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/"
+	for _, caseFold := range []bool{false, true} {
+		for setIndex, needles := range patternSets {
+			t.Run(fmt.Sprintf("fold_%v_set_%d", caseFold, setIndex), func(t *testing.T) {
+				random := rand.New(rand.NewSource(int64(setIndex + 1)))
+				matcher := newIndexedMatcher(needles, caseFold)
+				for iteration := 0; iteration < 5000; iteration++ {
+					value := make([]byte, random.Intn(512))
+					for i := range value {
+						value[i] = alphabet[random.Intn(len(alphabet))]
+					}
+					if len(value) != 0 && random.Intn(2) == 0 {
+						needle := []byte(needles[random.Intn(len(needles))])
+						if caseFold {
+							for i, c := range needle {
+								if c >= 'a' && c <= 'z' && random.Intn(2) == 0 {
+									needle[i] = c - ('a' - 'A')
+								}
+							}
+						}
+						if len(needle) <= len(value) {
+							start := random.Intn(len(value) - len(needle) + 1)
+							copy(value[start:], needle)
+						}
+					}
+
+					text := string(value)
+					searchText := text
+					if caseFold {
+						searchText = strings.ToLower(searchText)
+					}
+					want := false
+					for _, needle := range needles {
+						if caseFold {
+							needle = strings.ToLower(needle)
+						}
+						if strings.Contains(searchText, needle) {
+							want = true
+							break
+						}
+					}
+					if have := matcher.match(text); have != want {
+						t.Fatalf("unexpected match for %q: want %v, have %v", text, want, have)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRequiredByteMatcherNeverRejectsNeedles(t *testing.T) {
+	needles := make([]string, 0, 302)
+	needles = append(needles, ";", "=")
+	for index := range 300 {
+		needles = append(needles, fmt.Sprintf("command_%03d_suffix", index))
+	}
+	for _, caseFold := range []bool{false, true} {
+		matcher := newRequiredByteMatcher(needles, caseFold)
+		for _, needle := range needles {
+			value := "prefix_" + needle + "_suffix"
+			if caseFold {
+				value = strings.ToUpper(value)
+			}
+			if !matcher.match(value) {
+				t.Fatalf("required-byte matcher rejected needle %q with caseFold=%v", needle, caseFold)
+			}
+		}
+	}
+}
+
+func TestRequiredByteMatcherReusesTransactionBytePresence(t *testing.T) {
+	waf := corazawaf.NewWAF()
+	tx := waf.NewTransaction()
+	t.Cleanup(func() {
+		if err := tx.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	value := strings.Repeat("x", cachedBytePresenceMinInputBytes*2)
+	negative := &requiredByteMatcher{ascii: true, characters: "z"}
+	negative.add('z', false)
+	if negative.matchWithState(tx, value) {
+		t.Fatal("unexpected required-byte match")
+	}
+	if _, found := tx.LoadBytePresence(value); !found {
+		t.Fatal("expected a complete negative scan to populate the transaction cache")
+	}
+
+	positive := &requiredByteMatcher{ascii: true, characters: "x"}
+	positive.add('x', false)
+	if !positive.matchWithState(tx, value) {
+		t.Fatal("cached byte presence rejected an existing byte")
+	}
+}
+
+func TestIndexedMatcherFoldsOnlyASCIIBytes(t *testing.T) {
+	needles := []string{
+		"http://169。254。169。254",
+		"http://⓪ⓧⓐ⑨｡⓪ⓧⓕⓔ",
+	}
+	matcher := newIndexedMatcher(needles, true)
+	for _, value := range []string{
+		"prefix HTTP://169。254。169。254 suffix",
+		"prefix HTTP://⓪ⓧⓐ⑨｡⓪ⓧⓕⓔ suffix",
+	} {
+		if !matcher.match(value) {
+			t.Errorf("expected mixed ASCII and Unicode needle to match %q", value)
+		}
+	}
+	if matcher.match("http://169.254.169.254") {
+		t.Error("expected Unicode punctuation to remain case-sensitive byte data")
+	}
+}
+
+func TestPrefilterSelectsFactoredSuffixAlternatives(t *testing.T) {
+	pattern := `(?i)(?:^|busybox[ ]+)(?:xargs|xterm|wget|whoami)`
+	pf := prefilterFunc(pattern)
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain the mandatory command alternatives")
+	}
+	for _, value := range []string{"xargs", "busybox WGET", "whoami"} {
+		if !pf(value) {
+			t.Errorf("expected a possible match for %q", value)
+		}
+	}
+	if pf(strings.Repeat("x", 64<<10)) {
+		t.Error("expected a repeated factored prefix without a complete suffix to be rejected")
 	}
 }
