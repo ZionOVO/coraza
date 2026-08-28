@@ -6,6 +6,8 @@ package operators
 import (
 	"testing"
 
+	"github.com/corazawaf/libinjection-go"
+
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
 )
 
@@ -25,6 +27,10 @@ func FuzzSQLi(f *testing.F) {
 	f.Fuzz(func(t *testing.T, tc string) {
 		tx := waf.NewTransaction()
 		defer tx.Close()
-		_ = sqli.Evaluate(tx, tc)
+		have := sqli.Evaluate(tx, tc)
+		want, _ := libinjection.IsSQLi(tc)
+		if have != want {
+			t.Fatalf("prefilter changed SQL injection result for %q: want %v, have %v", tc, want, have)
+		}
 	})
 }
