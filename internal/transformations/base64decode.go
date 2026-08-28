@@ -4,8 +4,11 @@
 package transformations
 
 import (
+	"encoding/base64"
 	"strings"
 	"unicode"
+
+	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
 )
 
 var base64DecMap = []byte{
@@ -42,10 +45,26 @@ func doBase64decode(src string, ext bool) string {
 	if slen == 0 {
 		return src
 	}
-
+	fallbackCapacity := 0
+	if !ext {
+		if beginsBase64Encoding(src) {
+			encoding := base64.RawStdEncoding
+			if strings.IndexByte(src, '=') >= 0 {
+				encoding = base64.StdEncoding
+			}
+			decoded := []byte(src)
+			n, err := encoding.Decode(decoded, decoded)
+			if err == nil {
+				return stringsutil.WrapUnsafe(decoded[:n])
+			}
+			fallbackCapacity = n
+		}
+	}
 	var n, x int
-	var dst strings.Builder
-	dst.Grow(slen)
+	if ext {
+		fallbackCapacity = slen
+	}
+	dst := make([]byte, 0, fallbackCapacity)
 
 	for i := range slen {
 		currChar := src[i]
@@ -101,9 +120,7 @@ func doBase64decode(src string, ext bool) string {
 		x = (x << 6) | int(decodedChar&0x3F)
 		n++
 		if n == 4 {
-			dst.WriteByte(byte(x >> 16))
-			dst.WriteByte(byte(x >> 8))
-			dst.WriteByte(byte(x))
+			dst = append(dst, byte(x>>16), byte(x>>8), byte(x))
 			n = 0
 			x = 0
 		}
@@ -113,12 +130,22 @@ func doBase64decode(src string, ext bool) string {
 	switch n {
 	case 2:
 		x <<= 12
-		dst.WriteByte(byte(x >> 16))
+		dst = append(dst, byte(x>>16))
 	case 3:
 		x <<= 6
-		dst.WriteByte(byte(x >> 16))
-		dst.WriteByte(byte(x >> 8))
+		dst = append(dst, byte(x>>16), byte(x>>8))
 	}
 
-	return dst.String()
+	return stringsutil.WrapUnsafe(dst)
+}
+
+func beginsBase64Encoding(src string) bool {
+	for index := 0; index < len(src); index++ {
+		current := src[index]
+		if current == '\r' || current == '\n' {
+			continue
+		}
+		return current < 128 && base64DecMap[current] != 127 && current != '='
+	}
+	return false
 }

@@ -6,10 +6,35 @@ package transformations
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // removeWhitespace removes all whitespace characters from input.
 func removeWhitespace(data string) (string, bool, error) {
+	for i := 0; i < len(data); {
+		current := data[i]
+		if current >= utf8.RuneSelf {
+			if current < 0xc2 || current > 0xf4 || i+1 >= len(data) || data[i+1]&0xc0 != 0x80 {
+				i++
+				continue
+			}
+			r, size := utf8.DecodeRuneInString(data[i:])
+			if size > 1 && unicode.IsSpace(r) {
+				return mapWithoutWhitespace(data)
+			}
+			i += size
+			continue
+		}
+		switch current {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			return mapWithoutWhitespace(data)
+		}
+		i++
+	}
+	return data, false, nil
+}
+
+func mapWithoutWhitespace(data string) (string, bool, error) {
 	changed := false
 	transformedData := strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {

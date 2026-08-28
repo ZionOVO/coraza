@@ -3,7 +3,12 @@
 
 package transformations
 
+import "strings"
+
 func replaceComments(data string) (string, bool, error) {
+	if !strings.Contains(data, "/*") {
+		return data, false, nil
+	}
 	transformedData, changed := doReplaceComments(data)
 	return transformedData, changed, nil
 }

@@ -10,6 +10,8 @@ import (
 	"testing"
 )
 
+var base64DecodeResult string
+
 var b64DecodeTests = []struct {
 	name     string
 	input    string
@@ -186,6 +188,19 @@ func TestBase64Decode(t *testing.T) {
 		})
 	}
 }
+
+func TestBase64DecodeInvalidPrefixDoesNotAllocate(t *testing.T) {
+	input := strings.Repeat("\x01\x02\x80\xff", 16<<10)
+	allocations := testing.AllocsPerRun(1_000, func() {
+		base64DecodeResult = doBase64decode(input, false)
+	})
+	if allocations != 0 {
+		t.Fatalf("invalid Base64 prefix allocated %.1f times", allocations)
+	}
+	if base64DecodeResult != "" {
+		t.Fatalf("invalid Base64 prefix decoded to %q", base64DecodeResult)
+	}
+}
 func BenchmarkB64Decode(b *testing.B) {
 	for _, tt := range b64DecodeTests {
 		b.Run(tt.input, func(b *testing.B) {
@@ -193,6 +208,23 @@ func BenchmarkB64Decode(b *testing.B) {
 				_, _, err := base64decode(tt.input)
 				if err != nil {
 					b.Error(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkB64DecodeLarge(b *testing.B) {
+	for name, input := range map[string]string{
+		"valid":          strings.Repeat("x", 64<<10),
+		"invalid_binary": strings.Repeat("\x01\x02\x80\xff", 16<<10),
+	} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for b.Loop() {
+				if _, _, err := base64decode(input); err != nil {
+					b.Fatal(err)
 				}
 			}
 		})

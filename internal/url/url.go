@@ -41,9 +41,14 @@ func doParseQuery(query string, separator byte, urlUnescape bool) map[string][]s
 // queryUnescape is a non-strict version of net/url.QueryUnescape.
 func queryUnescape(input string) string {
 	ilen := len(input)
+	start := strings.IndexAny(input, "%+")
+	if start < 0 {
+		return input
+	}
 	res := strings.Builder{}
 	res.Grow(ilen)
-	for i := 0; i < ilen; i++ {
+	res.WriteString(input[:start])
+	for i := start; i < ilen; i++ {
 		ci := input[i]
 		if ci == '+' {
 			res.WriteByte(' ')
