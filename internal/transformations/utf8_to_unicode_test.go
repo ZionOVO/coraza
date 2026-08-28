@@ -3,7 +3,13 @@
 
 package transformations
 
-import "testing"
+import (
+	"math/rand"
+	"strconv"
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 func TestUTF8ToUnicode(t *testing.T) {
 	tests := []struct {
@@ -57,18 +63,59 @@ func TestUTF8ToUnicode(t *testing.T) {
 	}
 }
 
+func TestUTF8ToUnicodeMatchesEstablishedEncoding(t *testing.T) {
+	random := rand.New(rand.NewSource(1))
+	for iteration := 0; iteration < 100_000; iteration++ {
+		input := make([]byte, random.Intn(257))
+		if _, err := random.Read(input); err != nil {
+			t.Fatal(err)
+		}
+		value := string(input)
+		want := referenceUTF8ToUnicode(value)
+		have, _, err := utf8ToUnicode(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if have != want {
+			t.Fatalf("utf8ToUnicode(%q) = %q, want %q", value, have, want)
+		}
+	}
+}
+
+func referenceUTF8ToUnicode(input string) string {
+	result := make([]byte, 0, len(input))
+	for _, current := range input {
+		if current < utf8.RuneSelf {
+			result = append(result, byte(current))
+			continue
+		}
+		digits := 1
+		for remaining := current; remaining > 0xf; remaining >>= 4 {
+			digits++
+		}
+		result = append(result, '%', 'u')
+		for range 4 - digits {
+			result = append(result, '0')
+		}
+		result = strconv.AppendUint(result, uint64(current), 16)
+	}
+	return string(result)
+}
+
 func BenchmarkUTF8ToUnicode(b *testing.B) {
-	tests := []string{
-		"",
-		"hello world",
-		"ハローワールド",
+	tests := map[string]string{
+		"empty":              "",
+		"ascii":              "hello world",
+		"unicode":            "ハローワールド",
+		"large_invalid_utf8": strings.Repeat("\x01\x02\x03\x04\x80\x81\xfe\xff", 8<<10),
 	}
 
-	for _, tc := range tests {
-		tt := tc
-		b.Run(tt, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				if _, _, err := utf8ToUnicode(tt); err != nil {
+	for name, input := range tests {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(input)))
+			for range b.N {
+				if _, _, err := utf8ToUnicode(input); err != nil {
 					b.Fatal(err)
 				}
 			}

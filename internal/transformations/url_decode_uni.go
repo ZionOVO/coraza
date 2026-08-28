@@ -4,32 +4,54 @@
 package transformations
 
 import (
-	"github.com/corazawaf/coraza/v3/internal/strings"
+	stdstrings "strings"
+
+	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
 )
 
 func urlDecodeUni(data string) (string, bool, error) {
-	for i := 0; i < len(data); i++ {
-		if data[i] == '%' || data[i] == '+' {
-			return inplaceUniDecode(data, []byte(data), i), true, nil
-		}
+	percent := stdstrings.IndexByte(data, '%')
+	plus := stdstrings.IndexByte(data, '+')
+	start := percent
+	if start < 0 || plus >= 0 && plus < start {
+		start = plus
+	}
+	if start >= 0 {
+		bufferLength := unicodeDecodedBufferLength(data, start)
+		buffer := make([]byte, bufferLength)
+		copy(buffer[:start], data[:start])
+		return inplaceUniDecode(data, buffer, start), true, nil
 	}
 	return data, false, nil
 }
 
+func unicodeDecodedBufferLength(input string, start int) int {
+	reduction := 0
+	for index := start; index+5 < len(input); index++ {
+		if input[index] == '%' && (input[index+1] == 'u' || input[index+1] == 'U') &&
+			stringsutil.ValidHex(input[index+2]) && stringsutil.ValidHex(input[index+3]) &&
+			stringsutil.ValidHex(input[index+4]) && stringsutil.ValidHex(input[index+5]) {
+			reduction += 5
+			index += 5
+		}
+	}
+	return len(input) - reduction
+}
+
 func inplaceUniDecode(input string, d []byte, pos int) string {
-	inputLen := len(d)
+	inputLen := len(input)
 	i := pos
 	c := pos
 	hmap := -1
 
 	for i < inputLen {
-		if d[i] == '%' {
+		if input[i] == '%' {
 			if (i+1 < inputLen) && ((input[i+1] == 'u') || (input[i+1] == 'U')) {
 				/* Character is a percent sign. */
 				/* IIS-specific %u encoding. */
 				if i+5 < inputLen {
 					/* We have at least 4 data bytes. */
-					if (strings.ValidHex(input[i+2])) && (strings.ValidHex(input[i+3])) && (strings.ValidHex(input[i+4])) && (strings.ValidHex(input[i+5])) {
+					if (stringsutil.ValidHex(input[i+2])) && (stringsutil.ValidHex(input[i+3])) && (stringsutil.ValidHex(input[i+4])) && (stringsutil.ValidHex(input[i+5])) {
 						/*
 							TODO unicode mapping
 							code = 0
@@ -58,7 +80,7 @@ func inplaceUniDecode(input string, d []byte, pos int) string {
 						} else {
 							/* We first make use of the lower byte here,
 							 * ignoring the higher byte. */
-							d[c] = strings.X2c(input[i+4:])
+							d[c] = stringsutil.X2c(input[i+4:])
 
 							/* Full width ASCII (ff01 - ff5e)
 							 * needs 0x20 added */
@@ -97,8 +119,8 @@ func inplaceUniDecode(input string, d []byte, pos int) string {
 					c1 := input[i+1]
 					c2 := input[i+2]
 
-					if strings.ValidHex(c1) && strings.ValidHex(c2) {
-						d[c] = strings.X2c(input[i+1:])
+					if stringsutil.ValidHex(c1) && stringsutil.ValidHex(c2) {
+						d[c] = stringsutil.X2c(input[i+1:])
 						c++
 						i += 3
 					} else {
@@ -128,5 +150,5 @@ func inplaceUniDecode(input string, d []byte, pos int) string {
 		}
 	}
 
-	return strings.WrapUnsafe(d[0:c])
+	return stringsutil.WrapUnsafe(d[0:c])
 }

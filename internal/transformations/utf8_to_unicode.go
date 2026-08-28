@@ -15,15 +15,14 @@
 package transformations
 
 import (
-	"strconv"
 	"unicode/utf8"
 
 	"github.com/corazawaf/coraza/v3/internal/strings"
 )
 
 func utf8ToUnicode(str string) (string, bool, error) {
-	for i, c := range str {
-		if c >= utf8.RuneSelf {
+	for i := range len(str) {
+		if str[i] >= utf8.RuneSelf {
 			return doUTF8ToUnicode(str, i), true, nil
 		}
 	}
@@ -31,36 +30,61 @@ func utf8ToUnicode(str string) (string, bool, error) {
 }
 
 func doUTF8ToUnicode(input string, pos int) string {
-	// Preallocate to length of input, the encoded string will be at least
-	// as long.
-	res := make([]byte, pos, len(input))
+	resultCapacity := 0
+	if _, size := utf8.DecodeRuneInString(input[pos:]); size == 1 {
+		nonASCIIBytes := 0
+		for index := pos; index < len(input); index++ {
+			if input[index] >= utf8.RuneSelf {
+				nonASCIIBytes++
+			}
+		}
+		maxInt := int(^uint(0) >> 1)
+		if nonASCIIBytes <= (maxInt-len(input))/5 {
+			resultCapacity = len(input) + 5*nonASCIIBytes
+		}
+	}
+	if resultCapacity == 0 {
+		resultCapacity = pos
+		for _, current := range input[pos:] {
+			if current < utf8.RuneSelf {
+				resultCapacity++
+				continue
+			}
+			resultCapacity += unicodeEscapeLength(current)
+		}
+	}
+
+	res := make([]byte, pos, resultCapacity)
 	copy(res, input[0:pos])
 
-	for _, c := range input[pos:] {
-		if c < utf8.RuneSelf {
-			res = append(res, byte(c))
+	for _, current := range input[pos:] {
+		if current < utf8.RuneSelf {
+			res = append(res, byte(current))
 			continue
 		}
-		cHexLen := numHexDigits(c)
-		res = append(res, '%', 'u')
-		// Pad to 4 characters
-		for i := 0; i < 4-cHexLen; i++ {
-			res = append(res, '0')
-		}
-		res = strconv.AppendUint(res, uint64(c), 16)
+		res = appendUnicodeEscape(res, current)
 	}
 
 	return strings.WrapUnsafe(res)
 }
 
-func numHexDigits(c rune) int {
+func unicodeEscapeLength(current rune) int {
 	switch {
-	case c <= 0xf:
-		return 1
-	case c <= 0xff:
-		return 2
-	case c <= 0xfff:
-		return 3
+	case current <= 0xffff:
+		return 6
+	case current <= 0xfffff:
+		return 7
+	default:
+		return 8
 	}
-	return 4
+}
+
+func appendUnicodeEscape(result []byte, current rune) []byte {
+	const hexadecimal = "0123456789abcdef"
+	digits := unicodeEscapeLength(current) - 2
+	result = append(result, '%', 'u')
+	for shift := (digits - 1) * 4; shift >= 0; shift -= 4 {
+		result = append(result, hexadecimal[uint32(current)>>shift&0xf])
+	}
+	return result
 }
