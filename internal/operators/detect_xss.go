@@ -6,6 +6,8 @@
 package operators
 
 import (
+	"strings"
+
 	"github.com/corazawaf/libinjection-go"
 
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
@@ -38,6 +40,11 @@ func newDetectXSS(plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 }
 
 func (o *detectXSS) Evaluate(_ plugintypes.TransactionState, value string) bool {
+	// libinjection can report XSS only after parsing a tag/comment opener or
+	// assigning an attribute value. Those paths require '<' or '='.
+	if !strings.ContainsAny(value, "<=") {
+		return false
+	}
 	return libinjection.IsXSS(value)
 }
 

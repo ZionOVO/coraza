@@ -38,12 +38,24 @@ func newDetectSQLi(plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 }
 
 func (o *detectSQLi) Evaluate(tx plugintypes.TransactionState, value string) bool {
+	if !containsPrintableASCII(value) {
+		return false
+	}
 	res, fingerprint := libinjection.IsSQLi(value)
 	if !res {
 		return false
 	}
 	tx.CaptureField(0, fingerprint)
 	return true
+}
+
+func containsPrintableASCII(value string) bool {
+	for index := range len(value) {
+		if value[index] >= 0x20 && value[index] <= 0x7e {
+			return true
+		}
+	}
+	return false
 }
 
 func init() {
