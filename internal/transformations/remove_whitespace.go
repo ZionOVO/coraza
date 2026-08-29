@@ -14,11 +14,10 @@ func removeWhitespace(data string) (string, bool, error) {
 	for i := 0; i < len(data); {
 		current := data[i]
 		if current >= utf8.RuneSelf {
-			if current < 0xc2 || current > 0xf4 || i+1 >= len(data) || data[i+1]&0xc0 != 0x80 {
-				i++
-				continue
-			}
 			r, size := utf8.DecodeRuneInString(data[i:])
+			if r == utf8.RuneError && size == 1 {
+				return mapWithoutWhitespace(data)
+			}
 			if size > 1 && unicode.IsSpace(r) {
 				return mapWithoutWhitespace(data)
 			}

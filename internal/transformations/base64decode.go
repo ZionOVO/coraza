@@ -47,7 +47,7 @@ func doBase64decode(src string, ext bool) string {
 	}
 	fallbackCapacity := 0
 	if !ext {
-		if beginsBase64Encoding(src) {
+		if beginsBase64Encoding(src) && hasBase64FastPathPrefix(src) {
 			encoding := base64.RawStdEncoding
 			if strings.IndexByte(src, '=') >= 0 {
 				encoding = base64.StdEncoding
@@ -148,4 +148,21 @@ func beginsBase64Encoding(src string) bool {
 		return current < 128 && base64DecMap[current] != 127 && current != '='
 	}
 	return false
+}
+
+func hasBase64FastPathPrefix(src string) bool {
+	const probeBytes = 64
+	limit := min(len(src), probeBytes)
+	seenData := false
+	for index := 0; index < limit; index++ {
+		current := src[index]
+		if current == '\r' || current == '\n' {
+			continue
+		}
+		if current >= 128 || base64DecMap[current] == 127 || !seenData && current == '=' {
+			return false
+		}
+		seenData = true
+	}
+	return seenData
 }

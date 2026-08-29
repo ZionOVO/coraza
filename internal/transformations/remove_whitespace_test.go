@@ -3,7 +3,12 @@
 
 package transformations
 
-import "testing"
+import (
+	"math/rand"
+	"strings"
+	"testing"
+	"unicode"
+)
 
 func TestRemoveWhiteSpace(t *testing.T) {
 	tests := []struct {
@@ -39,4 +44,40 @@ func TestRemoveWhiteSpace(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRemoveWhitespaceMatchesStringsMapForArbitraryBytes(t *testing.T) {
+	random := rand.New(rand.NewSource(1))
+	inputs := [][]byte{{0xff, 'A', 'B', 'C'}}
+	for range 5_000 {
+		data := make([]byte, random.Intn(257))
+		if _, err := random.Read(data); err != nil {
+			t.Fatal(err)
+		}
+		inputs = append(inputs, data)
+	}
+
+	for _, input := range inputs {
+		value := string(input)
+		want, wantChanged := removeWhitespaceReference(value)
+		have, haveChanged, err := removeWhitespace(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if have != want || haveChanged != wantChanged {
+			t.Fatalf("input %x: want %x changed=%t, have %x changed=%t", input, []byte(want), wantChanged, []byte(have), haveChanged)
+		}
+	}
+}
+
+func removeWhitespaceReference(data string) (string, bool) {
+	changed := false
+	transformed := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			changed = true
+			return -1
+		}
+		return r
+	}, data)
+	return transformed, changed
 }

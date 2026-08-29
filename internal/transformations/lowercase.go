@@ -38,10 +38,13 @@ func lowerCase(data string) (string, bool, error) {
 		_, size := utf8.DecodeRuneInString(data[firstChange:])
 		remaining := len(data) - firstChange
 		maxInt := int(^uint(0) >> 1)
-		if size == 1 && remaining <= (maxInt-firstChange)/3 {
-			// An invalid leading byte strongly identifies opaque binary input. Each
-			// invalid byte can expand to the three-byte replacement rune.
-			resultCapacity = firstChange + 3*remaining
+		if size == 1 {
+			switch {
+			case utf8.ValidString(data[firstChange+1:]) && len(data) <= maxInt-2:
+				resultCapacity = len(data) + 2
+			case remaining <= (maxInt-firstChange)/3:
+				resultCapacity = firstChange + 3*remaining
+			}
 		}
 	}
 

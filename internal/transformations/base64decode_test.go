@@ -6,6 +6,7 @@ package transformations
 import (
 	"bytes"
 	"encoding/base64"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -201,6 +202,69 @@ func TestBase64DecodeInvalidPrefixDoesNotAllocate(t *testing.T) {
 		t.Fatalf("invalid Base64 prefix decoded to %q", base64DecodeResult)
 	}
 }
+
+func TestBase64DecodeFastPathMatchesEstablishedDecoder(t *testing.T) {
+	inputs := []string{
+		strings.Repeat("QUJD", 16<<10),
+		strings.Repeat("plain natural language sentence ", 2048),
+		strings.Repeat("A", 63) + ":" + strings.Repeat("A", 1024),
+		strings.Repeat("A", 256) + ":" + strings.Repeat("A", 1024),
+	}
+	random := rand.New(rand.NewSource(1))
+	for iteration := 0; iteration < 100_000; iteration++ {
+		input := make([]byte, random.Intn(257))
+		if _, err := random.Read(input); err != nil {
+			t.Fatal(err)
+		}
+		inputs = append(inputs, string(input))
+	}
+	for _, input := range inputs {
+		have := doBase64decode(input, false)
+		want := referenceBase64Decode(input)
+		if have != want {
+			t.Fatalf("doBase64decode(%q) = %q, want %q", input, have, want)
+		}
+	}
+}
+
+func referenceBase64Decode(src string) string {
+	var n, x int
+	var dst strings.Builder
+	dst.Grow(len(src))
+	for index := 0; index < len(src); index++ {
+		current := src[index]
+		if current == '\r' || current == '\n' {
+			continue
+		}
+		if current == '=' || current == ' ' || current > 127 {
+			break
+		}
+		decoded := base64DecMap[current]
+		if decoded == 127 {
+			break
+		}
+		x = x<<6 | int(decoded&0x3f)
+		n++
+		if n == 4 {
+			dst.WriteByte(byte(x >> 16))
+			dst.WriteByte(byte(x >> 8))
+			dst.WriteByte(byte(x))
+			n = 0
+			x = 0
+		}
+	}
+	switch n {
+	case 2:
+		x <<= 12
+		dst.WriteByte(byte(x >> 16))
+	case 3:
+		x <<= 6
+		dst.WriteByte(byte(x >> 16))
+		dst.WriteByte(byte(x >> 8))
+	}
+	return dst.String()
+}
+
 func BenchmarkB64Decode(b *testing.B) {
 	for _, tt := range b64DecodeTests {
 		b.Run(tt.input, func(b *testing.B) {
