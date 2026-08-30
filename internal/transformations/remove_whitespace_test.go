@@ -46,6 +46,50 @@ func TestRemoveWhiteSpace(t *testing.T) {
 	}
 }
 
+func TestRemoveWhitespacePreservesUnicodeAndInvalidUTF8Semantics(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		want        string
+		wantChanged bool
+	}{
+		{
+			name:        "non-breaking space",
+			input:       "before\xc2\xa0after",
+			want:        "beforeafter",
+			wantChanged: true,
+		},
+		{
+			name:        "em space",
+			input:       "before\xe2\x80\x83after",
+			want:        "beforeafter",
+			wantChanged: true,
+		},
+		{
+			name:  "non-whitespace C1 control",
+			input: "before\xc2\x80after",
+			want:  "before\xc2\x80after",
+		},
+		{
+			name:  "invalid UTF-8",
+			input: "before\xffafter",
+			want:  "before\xef\xbf\xbdafter",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			have, changed, err := removeWhitespace(test.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if have != test.want || changed != test.wantChanged {
+				t.Fatalf("removeWhitespace(%x) = %x, %t; want %x, %t", []byte(test.input), []byte(have), changed, []byte(test.want), test.wantChanged)
+			}
+		})
+	}
+}
+
 func TestRemoveWhitespaceMatchesStringsMapForArbitraryBytes(t *testing.T) {
 	random := rand.New(rand.NewSource(1))
 	inputs := [][]byte{{0xff, 'A', 'B', 'C'}}
