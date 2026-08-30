@@ -106,21 +106,6 @@ func TestRXAcceleratorIsOptInAndMalformedUTF8FallsBack(t *testing.T) {
 	}
 }
 
-type testMemoizer struct {
-	values map[string]any
-}
-
-func (memoizer *testMemoizer) Do(key string, compile func() (any, error)) (any, error) {
-	if value, ok := memoizer.values[key]; ok {
-		return value, nil
-	}
-	value, err := compile()
-	if err == nil {
-		memoizer.values[key] = value
-	}
-	return value, err
-}
-
 func FuzzAcceleratedRegexpMatchesGoRegexp(f *testing.F) {
 	for _, seed := range []struct {
 		pattern string
