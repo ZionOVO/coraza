@@ -5,6 +5,7 @@ package coraza_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -134,6 +135,15 @@ func newYufengFullWAF(tb testing.TB) coraza.WAF {
 
 func newYufengWAFWithDirectives(tb testing.TB, directives string) coraza.WAF {
 	tb.Helper()
+	waf := newUnmanagedYufengWAFWithDirectives(tb, directives)
+	tb.Cleanup(func() {
+		closeYufengWAF(tb, waf)
+	})
+	return waf
+}
+
+func newUnmanagedYufengWAFWithDirectives(tb testing.TB, directives string) coraza.WAF {
+	tb.Helper()
 	waf, err := coraza.NewWAF(coraza.NewWAFConfig().
 		WithRootFS(portableRootFS{FS: coreruleset.FS}).
 		WithDirectives(directives))
@@ -143,8 +153,26 @@ func newYufengWAFWithDirectives(tb testing.TB, directives string) coraza.WAF {
 	return waf
 }
 
+func closeYufengWAF(tb testing.TB, waf coraza.WAF) {
+	tb.Helper()
+	closer, ok := waf.(interface{ Close() error })
+	if !ok {
+		tb.Error("WAF does not support lifecycle close")
+		return
+	}
+	if err := closer.Close(); err != nil {
+		tb.Errorf("close WAF: %v", err)
+	}
+}
+
 func processYufengRequest(waf coraza.WAF, request yufengRequest) ([]int, error) {
 	tx := waf.NewTransaction()
+	closeWithError := func(cause error) error {
+		if err := tx.Close(); err != nil {
+			return errors.Join(cause, fmt.Errorf("close transaction: %w", err))
+		}
+		return cause
+	}
 	tx.ProcessConnection("192.0.2.10", 49152, "192.0.2.20", 443)
 	tx.ProcessURI(request.uri, request.method, "HTTP/1.1")
 	tx.SetServerName("app.example")
@@ -155,21 +183,17 @@ func processYufengRequest(waf coraza.WAF, request yufengRequest) ([]int, error) 
 		tx.AddRequestHeader("Content-Type", request.contentType)
 	}
 	if interruption := tx.ProcessRequestHeaders(); interruption != nil {
-		_ = tx.Close()
-		return nil, fmt.Errorf("request headers interrupted with status %d", interruption.Status)
+		return nil, closeWithError(fmt.Errorf("request headers interrupted with status %d", interruption.Status))
 	}
 	if len(request.body) > 0 {
 		if _, _, err := tx.WriteRequestBody(request.body); err != nil {
-			_ = tx.Close()
-			return nil, fmt.Errorf("write request body: %w", err)
+			return nil, closeWithError(fmt.Errorf("write request body: %w", err))
 		}
 	}
 	if interruption, err := tx.ProcessRequestBody(); err != nil {
-		_ = tx.Close()
-		return nil, fmt.Errorf("process request body: %w", err)
+		return nil, closeWithError(fmt.Errorf("process request body: %w", err))
 	} else if interruption != nil {
-		_ = tx.Close()
-		return nil, fmt.Errorf("request body interrupted with status %d", interruption.Status)
+		return nil, closeWithError(fmt.Errorf("request body interrupted with status %d", interruption.Status))
 	}
 
 	matched := tx.MatchedRules()
@@ -257,9 +281,13 @@ func TestYufengWAFMemoryFootprint(t *testing.T) {
 }
 
 func BenchmarkYufengWAFInitialization(b *testing.B) {
+	newYufengWAF(b)
 	b.ReportAllocs()
 	for b.Loop() {
-		newYufengWAF(b)
+		waf := newUnmanagedYufengWAFWithDirectives(b, yufengDirectives)
+		b.StopTimer()
+		closeYufengWAF(b, waf)
+		b.StartTimer()
 	}
 }
 

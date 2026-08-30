@@ -48,61 +48,80 @@ func (m *Memoizer) addOwner(e *entry) bool {
 // Do returns a cached value for key, or calls fn and caches the result.
 // Only one execution is in-flight for a given key at a time.
 func (m *Memoizer) Do(key string, fn func() (any, error)) (any, error) {
-	// Fast path: check cache
-	if v, ok := cache.Load(key); ok {
-		e := v.(*entry)
-		if m.addOwner(e) {
-			return e.value, nil
-		}
-		// Entry was deleted concurrently; fall through to slow path.
-	}
-
-	// Slow path: singleflight ensures only one compilation per key
-	val, err, _ := group.Do(key, func() (any, error) {
-		// Double-check after acquiring singleflight
+	for {
+		// Fast path: check cache
 		if v, ok := cache.Load(key); ok {
 			e := v.(*entry)
 			if m.addOwner(e) {
 				return e.value, nil
 			}
+			// Entry was deleted concurrently; fall through to slow path.
 		}
 
-		data, innerErr := fn()
-		if innerErr == nil {
-			e := &entry{
+		// Slow path: singleflight ensures only one compilation per key.
+		result, err, _ := group.Do(key, func() (any, error) {
+			// Double-check after acquiring singleflight.
+			if v, ok := cache.Load(key); ok {
+				e := v.(*entry)
+				if m.addOwner(e) {
+					return e, nil
+				}
+			}
+
+			data, innerErr := fn()
+			if innerErr != nil {
+				return data, innerErr
+			}
+			candidate := &entry{
 				value:  data,
 				owners: map[uint64]struct{}{m.ownerID: {}},
 			}
-			cache.Store(key, e)
+			for {
+				actual, loaded := cache.LoadOrStore(key, candidate)
+				if !loaded {
+					return candidate, nil
+				}
+				e := actual.(*entry)
+				if m.addOwner(e) {
+					return e, nil
+				}
+				// Release marked this entry before removing it from the map.
+				cache.CompareAndDelete(key, e)
+			}
+		})
+		if err != nil {
+			return result, err
 		}
-		return data, innerErr
-	})
 
-	// Ensure this caller is registered as an owner even if its execution
-	// was deduplicated by singleflight.
-	if err == nil {
-		if v, ok := cache.Load(key); ok {
-			e := v.(*entry)
-			m.addOwner(e)
+		// Every caller must own the exact entry whose value it returns. A
+		// waiter can observe that entry after its compiling owner released it;
+		// retry instead of registering the waiter on a concurrent replacement.
+		e := result.(*entry)
+		if m.addOwner(e) {
+			return e.value, nil
 		}
 	}
-
-	return val, err
 }
 
 // Release removes ownerID from all cached entries, deleting entries with no remaining owners.
 func Release(ownerID uint64) {
 	cache.Range(func(key, value any) bool {
 		e := value.(*entry)
-		e.mu.Lock()
-		delete(e.owners, ownerID)
-		if len(e.owners) == 0 {
-			e.deleted = true
-			cache.Delete(key)
-		}
-		e.mu.Unlock()
+		releaseEntry(key, e, ownerID)
 		return true
 	})
+}
+
+func releaseEntry(key any, e *entry, ownerID uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.owners, ownerID)
+	if len(e.owners) == 0 {
+		e.deleted = true
+		// A concurrent compiler may already have replaced a deleted entry.
+		// Delete only the entry observed by Release so its replacement survives.
+		cache.CompareAndDelete(key, e)
+	}
 }
 
 // Reset clears the entire cache. Intended for testing.

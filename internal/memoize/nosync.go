@@ -27,28 +27,44 @@ func NewMemoizer(ownerID uint64) *Memoizer {
 	return &Memoizer{ownerID: ownerID}
 }
 
+func (m *Memoizer) addOwner(e *entry) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.deleted {
+		return false
+	}
+	e.owners[m.ownerID] = struct{}{}
+	return true
+}
+
 // Do returns a cached value for key, or calls fn and caches the result.
 func (m *Memoizer) Do(key string, fn func() (any, error)) (any, error) {
-	if v, ok := cache.Load(key); ok {
-		e := v.(*entry)
-		e.mu.Lock()
-		if !e.deleted {
-			e.owners[m.ownerID] = struct{}{}
-			e.mu.Unlock()
-			return e.value, nil
+	for {
+		if v, ok := cache.Load(key); ok {
+			e := v.(*entry)
+			if m.addOwner(e) {
+				return e.value, nil
+			}
 		}
-		e.mu.Unlock()
-	}
 
-	data, err := fn()
-	if err == nil {
-		e := &entry{
+		data, err := fn()
+		if err != nil {
+			return data, err
+		}
+		candidate := &entry{
 			value:  data,
 			owners: map[uint64]struct{}{m.ownerID: {}},
 		}
-		cache.Store(key, e)
+		actual, loaded := cache.LoadOrStore(key, candidate)
+		if !loaded {
+			return data, nil
+		}
+		e := actual.(*entry)
+		if m.addOwner(e) {
+			return e.value, nil
+		}
+		cache.CompareAndDelete(key, e)
 	}
-	return data, err
 }
 
 // Release removes ownerID from all cached entries, deleting entries with no remaining owners.
@@ -57,20 +73,24 @@ func (m *Memoizer) Do(key string, fn func() (any, error)) (any, error) {
 // holds its internal lock for the entire Range call, so calling Delete inside
 // the callback would deadlock.
 func Release(ownerID uint64) {
-	var toDelete []any
+	type pendingDelete struct {
+		key   any
+		entry *entry
+	}
+	var toDelete []pendingDelete
 	cache.Range(func(key, value any) bool {
 		e := value.(*entry)
 		e.mu.Lock()
 		delete(e.owners, ownerID)
 		if len(e.owners) == 0 {
 			e.deleted = true
-			toDelete = append(toDelete, key)
+			toDelete = append(toDelete, pendingDelete{key: key, entry: e})
 		}
 		e.mu.Unlock()
 		return true
 	})
-	for _, key := range toDelete {
-		cache.Delete(key)
+	for _, pending := range toDelete {
+		cache.CompareAndDelete(pending.key, pending.entry)
 	}
 }
 

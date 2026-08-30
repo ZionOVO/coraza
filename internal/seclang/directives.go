@@ -1117,7 +1117,8 @@ func directiveSecAuditLogRelevantStatus(options *DirectiveOptions) error {
 		return errEmptyOptions
 	}
 
-	re, err := options.WAF.Memoizer().Do(options.Opts, func() (any, error) { return regexp.Compile(options.Opts) })
+	key := "audit-log-relevant-status-regexp:" + options.Opts
+	re, err := options.WAF.Memoizer().Do(key, func() (any, error) { return regexp.Compile(options.Opts) })
 	if err != nil {
 		return err
 	}
