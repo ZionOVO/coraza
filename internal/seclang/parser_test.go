@@ -7,11 +7,11 @@ import (
 	"bufio"
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/jcchavezs/mergefs"
@@ -141,13 +141,12 @@ func TestLoadConfigurationFileWithMultiFs(t *testing.T) {
 	}
 
 	err = p.FromFile("../doesnotexist.conf")
-	// Go and TinyGo have different error messages
-	if !strings.Contains(err.Error(), "no such file or directory") && !strings.Contains(err.Error(), "file does not exist") {
+	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("expected not found error. Got: %s", err.Error())
 	}
 
 	err = p.FromFile("/tmp/doesnotexist.conf")
-	if !strings.Contains(err.Error(), "no such file or directory") && !strings.Contains(err.Error(), "file does not exist") {
+	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("expected not found error. Got: %s", err.Error())
 	}
 

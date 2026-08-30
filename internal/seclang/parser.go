@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -38,6 +39,7 @@ type Parser struct {
 // It will return an error if there are no files matching the pattern.
 func (p *Parser) FromFile(profilePath string) error {
 	originalDir := p.currentDir
+	profilePath = filepath.ToSlash(profilePath)
 
 	var files []string
 	isGlob := strings.Contains(profilePath, "*")
@@ -45,7 +47,7 @@ func (p *Parser) FromFile(profilePath string) error {
 		var err error
 		files, err = fs.Glob(p.root, profilePath)
 		if err != nil {
-			return fmt.Errorf("failed to glob: %s", err.Error())
+			return fmt.Errorf("failed to glob: %w", err)
 		}
 
 		if len(files) == 0 {
@@ -56,25 +58,25 @@ func (p *Parser) FromFile(profilePath string) error {
 	}
 
 	for _, profilePath := range files {
-		profilePath = strings.TrimSpace(profilePath)
+		profilePath = filepath.ToSlash(strings.TrimSpace(profilePath))
 		// Glob results are already resolvable against p.root, in the same frame
 		// of reference fs.Glob used to match them, so they must not be
 		// re-anchored to currentDir. Doing so pointed the read at a path the
 		// glob never matched, and on Windows it also rewrote the forward
 		// slashes io/fs mandates into OS separators, which no fs.FS can
 		// resolve.
-		if !isGlob && !strings.HasPrefix(profilePath, "/") {
-			profilePath = filepath.Join(p.currentDir, profilePath)
+		if !isGlob && !path.IsAbs(profilePath) && !filepath.IsAbs(profilePath) {
+			profilePath = path.Join(p.currentDir, profilePath)
 		}
 		p.currentFile = profilePath
 		lastDir := p.currentDir
-		p.currentDir = filepath.Dir(profilePath)
+		p.currentDir = path.Dir(profilePath)
 		file, err := fs.ReadFile(p.root, profilePath)
 		if err != nil {
 			// we don't use defer for this as tinygo does not seem to like it
 			p.currentDir = originalDir
 			p.currentFile = ""
-			return fmt.Errorf("failed to readfile: %s", err.Error())
+			return fmt.Errorf("failed to read file: %w", err)
 		}
 
 		err = p.parseString(string(file))
@@ -82,7 +84,7 @@ func (p *Parser) FromFile(profilePath string) error {
 			// we don't use defer for this as tinygo does not seem to like it
 			p.currentDir = originalDir
 			p.currentFile = ""
-			return fmt.Errorf("failed to parse string: %s", err.Error())
+			return fmt.Errorf("failed to parse string: %w", err)
 		}
 		// restore the lastDir post processing all includes
 		p.currentDir = lastDir
