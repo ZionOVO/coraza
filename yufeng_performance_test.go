@@ -346,8 +346,18 @@ func TestYufengWAFMemoryFootprint(t *testing.T) {
 	runtime.KeepAlive(waf)
 }
 
-func BenchmarkYufengWAFInitialization(b *testing.B) {
+func BenchmarkYufengWAFOverlappingReload(b *testing.B) {
 	newYufengWAF(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		waf := newUnmanagedYufengWAFWithDirectives(b, yufengDirectives)
+		b.StopTimer()
+		closeYufengWAF(b, waf)
+		b.StartTimer()
+	}
+}
+
+func BenchmarkYufengWAFColdInitialization(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		waf := newUnmanagedYufengWAFWithDirectives(b, yufengDirectives)
