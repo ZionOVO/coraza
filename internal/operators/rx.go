@@ -210,7 +210,13 @@ func captureRXMatch(tx plugintypes.TransactionState, value string, match []int) 
 // binaryRx is exactly the same as rx, but using the binaryregexp package for matching
 // arbitrary bytes.
 type binaryRX struct {
-	re *binaryregexp.Regexp
+	re        *binaryregexp.Regexp
+	prefilter *binaryRequiredPrefilter
+}
+
+type binaryRXCompiled struct {
+	re        *binaryregexp.Regexp
+	prefilter *binaryRequiredPrefilter
 }
 
 var _ plugintypes.Operator = (*binaryRX)(nil)
@@ -218,29 +224,33 @@ var _ plugintypes.Operator = (*binaryRX)(nil)
 func newBinaryRX(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 	data := options.Arguments
 
-	re, err := memoizeDo(options.Memoizer, "binary-rx:"+data, func() (any, error) { return binaryregexp.Compile(data) })
+	cacheKey := fmt.Sprintf("binary-rx:%t:%s", options.RxPreFilterEnabled, data)
+	compiled, err := memoizeDo(options.Memoizer, cacheKey, func() (any, error) {
+		re, err := binaryregexp.Compile(data)
+		if err != nil {
+			return nil, err
+		}
+		result := &binaryRXCompiled{re: re}
+		if options.RxPreFilterEnabled {
+			result.prefilter = compileBinaryRequiredPrefilter(data)
+		}
+		return result, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &binaryRX{re: re.(*binaryregexp.Regexp)}, nil
+	result := compiled.(*binaryRXCompiled)
+	return &binaryRX{re: result.re, prefilter: result.prefilter}, nil
 }
 
 func (o *binaryRX) Evaluate(tx plugintypes.TransactionState, value string) bool {
-	if tx.Capturing() {
-		match := o.re.FindStringSubmatch(value)
-		if len(match) == 0 {
-			return false
-		}
-		for i, c := range match {
-			if i == 9 {
-				return true
-			}
-			tx.CaptureField(i, c)
-		}
-		return true
-	} else {
-		return o.re.MatchString(value)
+	if o.prefilter != nil && !o.prefilter.possible(tx, value) {
+		return false
 	}
+	if tx.Capturing() {
+		return captureRXMatch(tx, value, o.re.FindStringSubmatchIndex(value))
+	}
+	return o.re.MatchString(value)
 }
 
 func init() {
