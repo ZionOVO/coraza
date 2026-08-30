@@ -21,6 +21,8 @@ import (
 	"github.com/corazawaf/coraza/v3/experimental/plugins"
 )
 
+// yufengBodyLimit bounds the request body used by capacity tests; reported
+// bytes measure WAF body processing and exclude transport and header overhead.
 const yufengBodyLimit = 64 << 10
 
 const portableNormalizePathWin = "yufengBenchmarkNormalizePathWin"
