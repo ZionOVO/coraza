@@ -32,10 +32,10 @@
 //   - "definitely no match" → skip regex (correct: required literals absent)
 //   - "maybe match" → run regex (conservative: may still not match)
 //
-// A bug in literal extraction can only make the prefilter say "maybe" too
-// often (degraded performance), never cause a false negative (missed attack).
-// This is safe by construction — the prefilter is a necessary-condition check,
-// not a sufficient-condition check.
+// Every extracted constraint must be a true necessary condition. Violating
+// that invariant can make the prefilter reject an input that the regular
+// expression accepts, so differential and fuzz tests compare every optimized
+// decision with the reference regular expression engine.
 //
 // Design principle: when in doubt, fall back to the regex. The prefilter is
 // purely an optimization. If there is any uncertainty about whether the input
@@ -287,8 +287,8 @@ func buildPrefilterFunc(pattern string) func(string) bool {
 		// A literal is the prefix/suffix constraint only when it survived
 		// filterShort (len >= 2), meaning it IS the first/last literal in the
 		// pattern and not replaced by a longer one that appeared elsewhere.
-		usePrefix := hasBeginAnchor(re) && len(origFirst) >= 2
-		useSuffix := hasEndAnchor(re) && len(origLast) >= 2
+		usePrefix := hasAnchoredLiteralPrefix(re, origFirst, caseInsensitive)
+		useSuffix := hasAnchoredLiteralSuffix(re, origLast, caseInsensitive)
 		if !usePrefix && !useSuffix {
 			// No anchor: sort longest-first for best early exit.
 			slices.SortFunc(filtered, func(a, b string) int { return len(b) - len(a) })
@@ -1226,39 +1226,39 @@ func containsFoldASCIIOnly(s, needle string) bool {
 // Anchor helpers (Gap 1)
 // ---------------------------------------------------------------------------
 
-// hasBeginAnchor reports whether re requires the match to start at position 0
-// of the input. Only OpBeginText (\A) is accepted — OpBeginLine (^ with (?m))
-// can match after any newline and is NOT a position-0 guarantee, so using
-// strings.HasPrefix for it would produce false negatives on multi-line inputs.
-func hasBeginAnchor(re *syntax.Regexp) bool {
-	switch re.Op {
-	case syntax.OpBeginText:
-		return true
-	case syntax.OpCapture:
-		return hasBeginAnchor(re.Sub[0])
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return hasBeginAnchor(re.Sub[0])
-		}
+// hasAnchoredLiteralPrefix reports whether literal is the first consuming
+// expression immediately after an absolute beginning anchor. Merely having an
+// anchor somewhere before the first extracted literal is insufficient: for
+// example, `^.00` is anchored but "00" starts at byte one, not byte zero.
+func hasAnchoredLiteralPrefix(re *syntax.Regexp, literal string, ci bool) bool {
+	for re.Op == syntax.OpCapture {
+		re = re.Sub[0]
 	}
-	return false
+	if literal == "" || re.Op != syntax.OpConcat || len(re.Sub) < 2 || re.Sub[0].Op != syntax.OpBeginText {
+		return false
+	}
+	return immediateLiteral(re.Sub[1], ci) == literal
 }
 
-// hasEndAnchor reports whether re requires the match to end at the very last
-// byte of the input. Only OpEndText (\z) is accepted for the same reason as
-// hasBeginAnchor — OpEndLine ($ with (?m)) can match before any newline.
-func hasEndAnchor(re *syntax.Regexp) bool {
-	switch re.Op {
-	case syntax.OpEndText:
-		return true
-	case syntax.OpCapture:
-		return hasEndAnchor(re.Sub[0])
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return hasEndAnchor(re.Sub[len(re.Sub)-1])
-		}
+// hasAnchoredLiteralSuffix reports whether literal is the last consuming
+// expression immediately before an absolute ending anchor. A wildcard or
+// another consuming expression between them makes a suffix check unsound.
+func hasAnchoredLiteralSuffix(re *syntax.Regexp, literal string, ci bool) bool {
+	for re.Op == syntax.OpCapture {
+		re = re.Sub[0]
 	}
-	return false
+	last := len(re.Sub) - 1
+	if literal == "" || re.Op != syntax.OpConcat || last < 1 || re.Sub[last].Op != syntax.OpEndText {
+		return false
+	}
+	return immediateLiteral(re.Sub[last-1], ci) == literal
+}
+
+func immediateLiteral(re *syntax.Regexp, ci bool) string {
+	for re.Op == syntax.OpCapture {
+		re = re.Sub[0]
+	}
+	return rawLiteral(re, ci)
 }
 
 // hasPrefixFoldASCII reports whether s begins with prefix (ASCII case-insensitive).
@@ -1366,8 +1366,8 @@ func buildCombinedPF(v combinedRequired, ci bool, re *syntax.Regexp) func(string
 
 	var allPF func(string) bool
 	if len(filteredAll) > 0 {
-		usePrefix := hasBeginAnchor(re) && len(origFirst) >= 2
-		useSuffix := hasEndAnchor(re) && len(origLast) >= 2
+		usePrefix := hasAnchoredLiteralPrefix(re, origFirst, ci)
+		useSuffix := hasAnchoredLiteralSuffix(re, origLast, ci)
 		if !usePrefix && !useSuffix {
 			slices.SortFunc(filteredAll, func(a, b string) int { return len(b) - len(a) })
 		}

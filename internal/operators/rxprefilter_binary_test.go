@@ -111,6 +111,35 @@ func TestBinaryRXPrefilterMatchesBinaryRegexp(t *testing.T) {
 	}
 }
 
+func FuzzBinaryRXPrefilterNoFalseNegatives(f *testing.F) {
+	for _, seed := range []struct {
+		pattern string
+		input   []byte
+	}{
+		{pattern: `\x{bc}[^>\x{be}]*[>\x{be}]|<[^\x{be}]*\x{be}`, input: []byte("\xbctest>")},
+		{pattern: `\xac\xed\x00\x05`, input: []byte("prefix\xac\xed\x00\x05suffix")},
+		{pattern: `\xff(?:foo)?bar\xfe`, input: []byte("\xfffffoobar\xfe")},
+		{pattern: `(?i)\xffheader:`, input: []byte("\xffHEADER:")},
+	} {
+		f.Add(seed.pattern, seed.input)
+	}
+
+	f.Fuzz(func(t *testing.T, pattern string, input []byte) {
+		if len(pattern) > 256 || len(input) > 512 {
+			return
+		}
+		reference, err := binaryregexp.Compile(pattern)
+		if err != nil {
+			return
+		}
+		filter := compileBinaryRequiredPrefilter(pattern)
+		value := string(input)
+		if filter != nil && reference.MatchString(value) && !filter.possible(nil, value) {
+			t.Fatalf("binary prefilter rejected match for pattern %q and input %x", pattern, input)
+		}
+	})
+}
+
 func TestBinaryRXPrefilterMemoizationSeparatesConfiguration(t *testing.T) {
 	const ownerID = 987654321
 	cache := memoize.NewMemoizer(ownerID)
