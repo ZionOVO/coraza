@@ -1,4 +1,4 @@
-//go:build coraza.rule.rx_prefilter
+//go:build coraza.rule.rx_prefilter && !coraza.disabled_operators.rx
 
 // rxprefilter_crs_test.go: correctness and benchmark tests driven entirely by
 // the official OWASP CRS.

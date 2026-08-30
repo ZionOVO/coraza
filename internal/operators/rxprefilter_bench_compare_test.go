@@ -1,4 +1,4 @@
-//go:build coraza.rule.rx_prefilter
+//go:build coraza.rule.rx_prefilter && !coraza.disabled_operators.rx
 
 // bench_compare_test.go: apples-to-apples benchmark against main.
 //
@@ -147,4 +147,3 @@ func BenchmarkCompare(b *testing.B) {
 		b.Log(pat.name, "→ prefilter:", hasPF)
 	}
 }
-

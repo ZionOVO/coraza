@@ -49,18 +49,9 @@ func TestPMFromDatasetCacheUsesDatasetContents(t *testing.T) {
 	}
 }
 
-func TestPMFromDatasetCacheCannotCollideWithRegex(t *testing.T) {
-	memoizer := &operatorTestMemoizer{values: map[string]any{}}
-	if _, err := newRX(plugintypes.OperatorOptions{
-		Arguments:          "needle",
-		Memoizer:           memoizer,
-		RxPreFilterEnabled: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if memoizer.lastKey == "" {
-		t.Fatal("regex did not use the memoizer")
-	}
+func TestPMFromDatasetCacheCannotCollideWithAnotherOperator(t *testing.T) {
+	const foreignKey = "blocked"
+	memoizer := &operatorTestMemoizer{values: map[string]any{foreignKey: struct{}{}}}
 
 	var datasetOperator plugintypes.Operator
 	func() {
@@ -71,8 +62,8 @@ func TestPMFromDatasetCacheCannotCollideWithRegex(t *testing.T) {
 		}()
 		var err error
 		datasetOperator, err = newPMFromDataset(plugintypes.OperatorOptions{
-			Arguments: memoizer.lastKey,
-			Datasets:  map[string][]string{memoizer.lastKey: {"blocked"}},
+			Arguments: foreignKey,
+			Datasets:  map[string][]string{foreignKey: {"blocked"}},
 			Memoizer:  memoizer,
 		})
 		if err != nil {

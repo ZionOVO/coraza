@@ -1,7 +1,7 @@
 // Copyright 2026 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build !tinygo && !wasm && !coraza.no_rx_acceleration
+//go:build !tinygo && !wasm && !coraza.no_rx_acceleration && !coraza.disabled_operators.rx
 
 package operators
 
