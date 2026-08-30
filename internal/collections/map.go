@@ -21,6 +21,7 @@ type Map struct {
 }
 
 var _ collection.Map = &Map{}
+var _ KeyedMatchAppender = &Map{}
 
 // NewMap creates a new Map. By default, the Map key is case insensitive.
 func NewMap(variable variables.RuleVariable) *Map {
@@ -139,6 +140,43 @@ func (c *Map) FindAll() []types.MatchData {
 			result[i] = &buf[i]
 			i++
 		}
+	}
+	return result
+}
+
+// AppendMatches appends all map elements to result.
+func (c *Map) AppendMatches(result []Match) []Match {
+	for _, data := range c.data {
+		for _, value := range data {
+			result = append(result, Match{Variable: c.variable, Key: value.key, Value: value.value})
+		}
+	}
+	return result
+}
+
+// AppendMatchesRegex appends map elements whose key matches key.
+func (c *Map) AppendMatchesRegex(result []Match, key *regexp.Regexp) []Match {
+	for current, data := range c.data {
+		if !key.MatchString(current) {
+			continue
+		}
+		for _, value := range data {
+			result = append(result, Match{Variable: c.variable, Key: value.key, Value: value.value})
+		}
+	}
+	return result
+}
+
+// AppendMatchesString appends map elements selected by key.
+func (c *Map) AppendMatchesString(result []Match, key string) []Match {
+	if key == "" {
+		return c.AppendMatches(result)
+	}
+	if !c.isCaseSensitive {
+		key = strings.ToLower(key)
+	}
+	for _, value := range c.data[key] {
+		result = append(result, Match{Variable: c.variable, Key: value.key, Value: value.value})
 	}
 	return result
 }

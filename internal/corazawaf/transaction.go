@@ -138,10 +138,13 @@ type Transaction struct {
 	variables TransactionVariables
 
 	transformationCache map[transformationKey]transformationValue
+	fieldMatches        []collections.Match
 
 	bytePresenceCache [4]bytePresenceCacheEntry
 	bytePresenceNext  uint8
 }
+
+const maxRetainedFieldMatches = 256
 
 type bytePresenceCacheEntry struct {
 	value   string
@@ -712,6 +715,76 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 			},
 		}
 	}
+	return matches
+}
+
+func (tx *Transaction) getFieldMatches(rv ruleVariableParams) []collections.Match {
+	matches := tx.fieldMatches[:0]
+	col := tx.Collection(rv.Variable)
+	if col == nil {
+		tx.fieldMatches = matches
+		return matches
+	}
+
+	switch {
+	case rv.KeyRx != nil:
+		if appender, ok := col.(collections.KeyedMatchAppender); ok {
+			matches = appender.AppendMatchesRegex(matches, rv.KeyRx)
+		} else if keyed, ok := col.(collection.Keyed); ok {
+			for _, match := range keyed.FindRegex(rv.KeyRx) {
+				matches = append(matches, collections.Match{Variable: match.Variable(), Key: match.Key(), Value: match.Value()})
+			}
+		} else {
+			tx.debugLogger.Error().Str("collection", rv.Variable.Name()).Msg("attempted to use regex with non-selectable collection")
+		}
+	case rv.KeyStr != "":
+		if appender, ok := col.(collections.KeyedMatchAppender); ok {
+			matches = appender.AppendMatchesString(matches, rv.KeyStr)
+		} else if keyed, ok := col.(collection.Keyed); ok {
+			for _, match := range keyed.FindString(rv.KeyStr) {
+				matches = append(matches, collections.Match{Variable: match.Variable(), Key: match.Key(), Value: match.Value()})
+			}
+		} else {
+			tx.debugLogger.Error().Str("collection", rv.Variable.Name()).Msg("attempted to use string with non-selectable collection")
+		}
+	default:
+		if appender, ok := col.(collections.MatchAppender); ok {
+			matches = appender.AppendMatches(matches)
+		} else {
+			for _, match := range col.FindAll() {
+				matches = append(matches, collections.Match{Variable: match.Variable(), Key: match.Key(), Value: match.Value()})
+			}
+		}
+	}
+
+	if len(rv.Exceptions) != 0 {
+		filteredCount := 0
+		for _, match := range matches {
+			isException := false
+			lowerKey := strings.ToLower(match.Key)
+			for _, exception := range rv.Exceptions {
+				if (exception.KeyRx != nil && exception.KeyRx.MatchString(lowerKey)) || strings.ToLower(exception.KeyStr) == lowerKey || (exception.KeyStr == "" && exception.KeyRx == nil) {
+					isException = true
+					break
+				}
+			}
+			if !isException {
+				matches[filteredCount] = match
+				filteredCount++
+			}
+		}
+		matches = matches[:filteredCount]
+	}
+
+	if rv.Count {
+		count := len(matches)
+		matches = append(matches[:0], collections.Match{
+			Variable: rv.Variable,
+			Key:      rv.KeyStr,
+			Value:    strconv.Itoa(count),
+		})
+	}
+	tx.fieldMatches = matches
 	return matches
 }
 
@@ -1719,6 +1792,12 @@ func (tx *Transaction) Close() error {
 	}
 
 	tx.variables.reset()
+	if cap(tx.fieldMatches) > maxRetainedFieldMatches {
+		tx.fieldMatches = nil
+	} else {
+		clear(tx.fieldMatches[:cap(tx.fieldMatches)])
+		tx.fieldMatches = tx.fieldMatches[:0]
+	}
 	for index := range tx.bytePresenceCache {
 		tx.bytePresenceCache[index] = bytePresenceCacheEntry{}
 	}

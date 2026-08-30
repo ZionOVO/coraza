@@ -20,6 +20,7 @@ type ConcatCollection struct {
 }
 
 var _ collection.Collection = &ConcatCollection{}
+var _ MatchAppender = &ConcatCollection{}
 
 func NewConcatCollection(variable variables.RuleVariable, data ...collection.Collection) *ConcatCollection {
 	return &ConcatCollection{
@@ -37,6 +38,22 @@ func (c *ConcatCollection) FindAll() []types.MatchData {
 	return res
 }
 
+// AppendMatches appends all values while exposing the concatenated variable.
+func (c *ConcatCollection) AppendMatches(result []Match) []Match {
+	for _, data := range c.data {
+		start := len(result)
+		if appender, ok := data.(MatchAppender); ok {
+			result = appender.AppendMatches(result)
+		} else {
+			for _, value := range data.FindAll() {
+				result = append(result, Match{Key: value.Key(), Value: value.Value()})
+			}
+		}
+		setMatchVariable(result[start:], c.variable)
+	}
+	return result
+}
+
 // Name returns the name for the current CollectionconcatCollection
 func (c *ConcatCollection) Name() string {
 	return c.variable.Name()
@@ -49,6 +66,7 @@ type ConcatKeyed struct {
 }
 
 var _ collection.Keyed = &ConcatKeyed{}
+var _ KeyedMatchAppender = &ConcatKeyed{}
 
 func NewConcatKeyed(variable variables.RuleVariable, data ...collection.Keyed) *ConcatKeyed {
 	return &ConcatKeyed{
@@ -91,6 +109,60 @@ func (c *ConcatKeyed) FindAll() []types.MatchData {
 		res = append(res, replaceVariable(c.variable, d.FindAll())...)
 	}
 	return res
+}
+
+// AppendMatches appends all keyed values while exposing the concatenated variable.
+func (c *ConcatKeyed) AppendMatches(result []Match) []Match {
+	for _, data := range c.data {
+		start := len(result)
+		if appender, ok := data.(MatchAppender); ok {
+			result = appender.AppendMatches(result)
+		} else {
+			for _, value := range data.FindAll() {
+				result = append(result, Match{Key: value.Key(), Value: value.Value()})
+			}
+		}
+		setMatchVariable(result[start:], c.variable)
+	}
+	return result
+}
+
+// AppendMatchesRegex appends regex-selected values while exposing the concatenated variable.
+func (c *ConcatKeyed) AppendMatchesRegex(result []Match, key *regexp.Regexp) []Match {
+	for _, data := range c.data {
+		start := len(result)
+		if appender, ok := data.(KeyedMatchAppender); ok {
+			result = appender.AppendMatchesRegex(result, key)
+		} else {
+			for _, value := range data.FindRegex(key) {
+				result = append(result, Match{Key: value.Key(), Value: value.Value()})
+			}
+		}
+		setMatchVariable(result[start:], c.variable)
+	}
+	return result
+}
+
+// AppendMatchesString appends string-selected values while exposing the concatenated variable.
+func (c *ConcatKeyed) AppendMatchesString(result []Match, key string) []Match {
+	for _, data := range c.data {
+		start := len(result)
+		if appender, ok := data.(KeyedMatchAppender); ok {
+			result = appender.AppendMatchesString(result, key)
+		} else {
+			for _, value := range data.FindString(key) {
+				result = append(result, Match{Key: value.Key(), Value: value.Value()})
+			}
+		}
+		setMatchVariable(result[start:], c.variable)
+	}
+	return result
+}
+
+func setMatchVariable(matches []Match, variable variables.RuleVariable) {
+	for index := range matches {
+		matches[index].Variable = variable
+	}
 }
 
 // Name returns the name for the current CollectionconcatCollection

@@ -13,6 +13,7 @@ import (
 	"github.com/corazawaf/coraza/v3/debuglog"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/macro"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
+	"github.com/corazawaf/coraza/v3/internal/collections"
 	"github.com/corazawaf/coraza/v3/internal/corazarules"
 	utils "github.com/corazawaf/coraza/v3/internal/strings"
 	"github.com/corazawaf/coraza/v3/types"
@@ -242,7 +243,7 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 			if multiphaseEvaluation && multiphaseSkipVariable(r, v.Variable, phase) {
 				continue
 			}
-			var values []types.MatchData
+			var values []collections.Match
 			for _, c := range ecol {
 				if c.Variable == v.Variable {
 					// TODO shall we check the pointer?
@@ -250,7 +251,7 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 				}
 			}
 
-			values = tx.GetField(v)
+			values = tx.getFieldMatches(v)
 
 			vLog := logger
 			if logger.Debug().IsEnabled() {
@@ -263,10 +264,10 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 			var argsLen int
 			for i, arg := range values {
 				if r.MultiMatch {
-					args, errs = r.transformMultiMatchArg(arg)
+					args, errs = r.transformMultiMatchField(arg)
 					argsLen = len(args)
 				} else {
-					args[0], errs = r.transformArg(arg, i, cache)
+					args[0], errs = r.transformField(arg, i, cache)
 					argsLen = 1
 				}
 				if len(errs) > 0 {
@@ -290,8 +291,8 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 					match := r.executeOperator(carg, tx)
 					if match {
 						mr := &corazarules.MatchData{
-							Variable_:   arg.Variable(),
-							Key_:        arg.Key(),
+							Variable_:   arg.Variable,
+							Key_:        arg.Key,
 							Value_:      carg,
 							ChainLevel_: chainLevel,
 						}
@@ -414,37 +415,53 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 }
 
 func (r *Rule) transformMultiMatchArg(arg types.MatchData) ([]string, []error) {
+	return r.transformMultiMatchField(collections.Match{
+		Variable: arg.Variable(),
+		Key:      arg.Key(),
+		Value:    arg.Value(),
+	})
+}
+
+func (r *Rule) transformMultiMatchField(arg collections.Match) ([]string, []error) {
 	// TODOs:
 	// - We don't need to run every transformation. We could try for each until found
 	// - Cache is not used for multimatch
-	return r.executeTransformationsMultimatch(arg.Value())
+	return r.executeTransformationsMultimatch(arg.Value)
 }
 
 func (r *Rule) transformArg(arg types.MatchData, argIdx int, cache map[transformationKey]transformationValue) (string, []error) {
+	return r.transformField(collections.Match{
+		Variable: arg.Variable(),
+		Key:      arg.Key(),
+		Value:    arg.Value(),
+	}, argIdx, cache)
+}
+
+func (r *Rule) transformField(arg collections.Match, argIdx int, cache map[transformationKey]transformationValue) (string, []error) {
 	switch {
 	case len(r.transformations) == 0:
-		return arg.Value(), nil
-	case arg.Variable().Name() == "TX":
+		return arg.Value, nil
+	case arg.Variable.Name() == "TX":
 		// no cache for TX
-		arg, errs := r.executeTransformations(arg.Value())
+		arg, errs := r.executeTransformations(arg.Value)
 		return arg, errs
 	default:
 		// NOTE: See comment on transformationKey struct to understand this hacky code
-		argKey := arg.Key()
+		argKey := arg.Key
 		argKeyPtr := unsafe.StringData(argKey)
 
 		// Search from longest prefix (full chain) backwards for a cache hit.
 		// Best case: full chain cached → single map lookup, done.
 		// Typical case: shared prefix cached → start computing from there.
 		startIdx := 0
-		value := arg.Value()
+		value := arg.Value
 		var errs []error
 
 		for i := len(r.transformationPrefixIDs) - 1; i >= 0; i-- {
 			key := transformationKey{
 				argKey:            argKeyPtr,
 				argIndex:          argIdx,
-				argVariable:       arg.Variable(),
+				argVariable:       arg.Variable,
 				transformationsID: r.transformationPrefixIDs[i],
 			}
 			if cached, ok := cache[key]; ok {
@@ -472,7 +489,7 @@ func (r *Rule) transformArg(arg types.MatchData, argIdx int, cache map[transform
 			key := transformationKey{
 				argKey:            argKeyPtr,
 				argIndex:          argIdx,
-				argVariable:       arg.Variable(),
+				argVariable:       arg.Variable,
 				transformationsID: r.transformationPrefixIDs[i],
 			}
 			cache[key] = transformationValue{arg: value, errs: errs}

@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -1193,7 +1194,7 @@ func TestRelevantAuditLoggingWithoutAuditFlag(t *testing.T) {
 // Transaction: when it does, make sure the field is reset on pool reuse, then
 // update wantFields.
 func TestTransactionFieldCount(t *testing.T) {
-	const wantFields = 37
+	const wantFields = 38
 	if got := reflect.TypeFor[Transaction]().NumField(); got != wantFields {
 		t.Fatalf("Transaction has %d fields, want %d. If you added a field, make sure it "+
 			"is reset on pool reuse in newTransaction() (or Close()), then update wantFields.", got, wantFields)
@@ -1722,6 +1723,128 @@ func TestTxGetField(t *testing.T) {
 	if err := tx.Close(); err != nil {
 		t.Fatalf("Failed to close transaction: %s", err.Error())
 	}
+}
+
+func TestTxGetFieldMatchesPreservesGetFieldSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*Transaction)
+		field   ruleVariableParams
+	}{
+		{
+			name:  "single collection",
+			field: ruleVariableParams{Variable: variables.RequestURI},
+		},
+		{
+			name:  "all keyed collection values",
+			field: ruleVariableParams{Variable: variables.RequestHeaders},
+		},
+		{
+			name:  "string key",
+			field: ruleVariableParams{Variable: variables.RequestHeaders, KeyStr: "host"},
+		},
+		{
+			name:  "regex key",
+			field: ruleVariableParams{Variable: variables.RequestHeaders, KeyRx: regexp.MustCompile(`^(host|x-test-header)$`)},
+		},
+		{
+			name: "string and regex exceptions",
+			field: ruleVariableParams{
+				Variable: variables.RequestHeaders,
+				Exceptions: []ruleVariableException{
+					{KeyStr: "host"},
+					{KeyRx: regexp.MustCompile(`^x-test-header$`)},
+				},
+			},
+		},
+		{
+			name: "whole collection exception",
+			field: ruleVariableParams{
+				Variable:   variables.RequestHeaders,
+				Exceptions: []ruleVariableException{{}},
+			},
+		},
+		{
+			name:  "count after filtering",
+			field: ruleVariableParams{Variable: variables.RequestHeaders, Count: true, Exceptions: []ruleVariableException{{KeyStr: "host"}}},
+		},
+		{
+			name:  "concatenated collection",
+			field: ruleVariableParams{Variable: variables.Args},
+		},
+		{
+			name:  "concatenated names collection",
+			field: ruleVariableParams{Variable: variables.ArgsNames},
+		},
+		{
+			name: "case-sensitive collection",
+			prepare: func(tx *Transaction) {
+				argsGet := collections.NewCaseSensitiveNamedCollection(variables.ArgsGet)
+				argsGet.Add("CaseKey", "upper")
+				argsGet.Add("casekey", "lower")
+				tx.variables.argsGet = argsGet
+			},
+			field: ruleVariableParams{Variable: variables.ArgsGet, KeyStr: "CaseKey"},
+		},
+		{
+			name:  "missing collection",
+			field: ruleVariableParams{Variable: variables.JSON},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tx := makeTransaction(t)
+			if test.prepare != nil {
+				test.prepare(tx)
+			}
+
+			want := snapshotPublicMatches(tx.GetField(test.field))
+			have := snapshotInternalMatches(tx.getFieldMatches(test.field))
+			if strings.Join(want, "\n") != strings.Join(have, "\n") {
+				t.Fatalf("getFieldMatches() = %q, GetField() = %q", have, want)
+			}
+
+			if err := tx.Close(); err != nil {
+				t.Fatalf("Failed to close transaction: %s", err.Error())
+			}
+		})
+	}
+}
+
+func TestTransactionCloseDropsOversizedFieldMatchBuffer(t *testing.T) {
+	tx := NewWAF().NewTransaction()
+	for index := range maxRetainedFieldMatches + 1 {
+		tx.AddGetRequestArgument(strconv.Itoa(index), "value")
+	}
+	matches := tx.getFieldMatches(ruleVariableParams{Variable: variables.ArgsGet})
+	if len(matches) != maxRetainedFieldMatches+1 {
+		t.Fatalf("field matches = %d, want %d", len(matches), maxRetainedFieldMatches+1)
+	}
+	if err := tx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if tx.fieldMatches != nil {
+		t.Fatalf("oversized field match buffer retained with capacity %d", cap(tx.fieldMatches))
+	}
+}
+
+func snapshotPublicMatches(matches []types.MatchData) []string {
+	result := make([]string, len(matches))
+	for index, match := range matches {
+		result[index] = fmt.Sprintf("%d\x00%s\x00%s", match.Variable(), match.Key(), match.Value())
+	}
+	sort.Strings(result)
+	return result
+}
+
+func snapshotInternalMatches(matches []collections.Match) []string {
+	result := make([]string, len(matches))
+	for index, match := range matches {
+		result[index] = fmt.Sprintf("%d\x00%s\x00%s", match.Variable, match.Key, match.Value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func BenchmarkTxGetField(b *testing.B) {

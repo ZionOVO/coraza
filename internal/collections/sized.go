@@ -21,6 +21,7 @@ type SizeCollection struct {
 }
 
 var _ collection.Collection = &SizeCollection{}
+var _ MatchAppender = &SizeCollection{}
 
 // NewSizeCollection returns a collection that
 // only returns the total sum of all the collections values
@@ -49,6 +50,11 @@ func (c *SizeCollection) FindAll() []types.MatchData {
 			Value_:    strconv.Itoa(c.size()),
 		},
 	}
+}
+
+// AppendMatches appends the aggregate collection size to result.
+func (c *SizeCollection) AppendMatches(result []Match) []Match {
+	return append(result, Match{Variable: c.variable, Value: strconv.Itoa(c.size())})
 }
 
 // Name returns the name for the current CollectionSizeProxy
