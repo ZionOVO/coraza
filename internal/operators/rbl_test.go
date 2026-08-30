@@ -6,20 +6,16 @@
 package operators
 
 import (
+	"context"
+	"errors"
+	"net"
 	"testing"
 
-	"github.com/foxcpp/go-mockdns"
+	"github.com/miekg/dns"
 
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
 )
-
-type testLogger struct{ t *testing.T }
-
-func (l *testLogger) Printf(format string, v ...any) {
-	l.t.Helper()
-	l.t.Logf(format, v...)
-}
 
 func TestRbl(t *testing.T) {
 	opts := plugintypes.OperatorOptions{
@@ -30,28 +26,7 @@ func TestRbl(t *testing.T) {
 		t.Fatal("Cannot init rbl operator")
 	}
 
-	logger := &testLogger{t}
-
-	srv, err := mockdns.NewServerWithLogger(map[string]mockdns.Zone{
-		"valid_no_txt.xbl.spamhaus.org.": {
-			A: []string{"1.2.3.4"},
-		},
-		"valid_txt.xbl.spamhaus.org.": {
-			A:   []string{"1.2.3.5"},
-			TXT: []string{"not blocked"},
-		},
-		"blocked.xbl.spamhaus.org.": {
-			A:   []string{"1.2.3.6"},
-			TXT: []string{"blocked"},
-		},
-	}, logger, false)
-	if err != nil {
-		t.Fatalf("Cannot start mockdns server: %v", err)
-	}
-	defer srv.Close()
-
-	srv.PatchNet(op.(*rbl).resolver)
-	defer mockdns.UnpatchNet(op.(*rbl).resolver)
+	op.(*rbl).resolver = newRBLTestResolver(t)
 
 	t.Run("Valid hostname with no TXT record", func(t *testing.T) {
 		if op.Evaluate(nil, "valid_no_txt") {
@@ -60,7 +35,7 @@ func TestRbl(t *testing.T) {
 	})
 
 	t.Run("Valid hostname with TXT record", func(t *testing.T) {
-		tx := corazawaf.NewWAF().NewTransaction()
+		tx := newRBLTestTransaction(t)
 		if !op.Evaluate(tx, "valid_txt") {
 			t.Errorf("Unexpected result for valid hostname")
 		}
@@ -76,7 +51,7 @@ func TestRbl(t *testing.T) {
 	})
 
 	t.Run("Blocked hostname", func(t *testing.T) {
-		tx := corazawaf.NewWAF().NewTransaction()
+		tx := newRBLTestTransaction(t)
 		if !op.Evaluate(tx, "blocked") {
 			t.Fatal("Unexpected result for blocked hostname")
 		}
@@ -85,4 +60,90 @@ func TestRbl(t *testing.T) {
 			t.Errorf("Unexpected result for valid hostname: want %q, have %q", want, have)
 		}
 	})
+}
+
+func newRBLTestResolver(t *testing.T) *net.Resolver {
+	t.Helper()
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for test DNS server: %v", err)
+	}
+
+	records := map[string]struct {
+		address string
+		text    string
+	}{
+		"valid_no_txt.xbl.spamhaus.org.": {address: "1.2.3.4"},
+		"valid_txt.xbl.spamhaus.org.":    {address: "1.2.3.5", text: "not blocked"},
+		"blocked.xbl.spamhaus.org.":      {address: "1.2.3.6", text: "blocked"},
+	}
+	handler := dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.RecursionAvailable = true
+		if len(request.Question) != 1 {
+			response.Rcode = dns.RcodeFormatError
+			_ = writer.WriteMsg(response)
+			return
+		}
+
+		question := request.Question[0]
+		record, found := records[question.Name]
+		if !found {
+			response.Rcode = dns.RcodeNameError
+			_ = writer.WriteMsg(response)
+			return
+		}
+		header := dns.RR_Header{Name: question.Name, Class: dns.ClassINET, Ttl: 60}
+		switch question.Qtype {
+		case dns.TypeA:
+			header.Rrtype = dns.TypeA
+			response.Answer = append(response.Answer, &dns.A{Hdr: header, A: net.ParseIP(record.address).To4()})
+		case dns.TypeTXT:
+			if record.text != "" {
+				header.Rrtype = dns.TypeTXT
+				response.Answer = append(response.Answer, &dns.TXT{Hdr: header, Txt: []string{record.text}})
+			}
+		}
+		_ = writer.WriteMsg(response)
+	})
+
+	server := &dns.Server{PacketConn: packet, Handler: handler}
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.ActivateAndServe()
+	}()
+	t.Cleanup(func() {
+		if err := packet.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("close test DNS listener: %v", err)
+		}
+		if err := <-serveErr; err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("serve test DNS: %v", err)
+		}
+	})
+
+	address := packet.LocalAddr().String()
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "udp4", address)
+		},
+	}
+}
+
+func newRBLTestTransaction(t *testing.T) *corazawaf.Transaction {
+	t.Helper()
+	waf := corazawaf.NewWAF()
+	t.Cleanup(func() {
+		if err := waf.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	tx := waf.NewTransaction()
+	t.Cleanup(func() {
+		if err := tx.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return tx
 }
