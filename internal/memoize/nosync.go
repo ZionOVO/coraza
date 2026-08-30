@@ -14,7 +14,38 @@ type entry struct {
 	deleted bool
 }
 
-var cache sync.Map // key -> *entry
+var (
+	cache sync.Map // key -> *entry
+
+	// TinyGo's sync.Map does not provide CompareAndDelete. This mutex makes
+	// the LoadOrStore and compare-and-delete sequence atomic with respect to
+	// every cache mutation performed by this file.
+	cacheMutationMu sync.Mutex
+)
+
+func loadOrStore(key string, value *entry) (any, bool) {
+	cacheMutationMu.Lock()
+	defer cacheMutationMu.Unlock()
+	return cache.LoadOrStore(key, value)
+}
+
+func deleteIfCurrent(key any, expected *entry) bool {
+	cacheMutationMu.Lock()
+	defer cacheMutationMu.Unlock()
+
+	actual, ok := cache.Load(key)
+	if !ok || actual != expected {
+		return false
+	}
+	cache.Delete(key)
+	return true
+}
+
+func deleteKey(key any) {
+	cacheMutationMu.Lock()
+	defer cacheMutationMu.Unlock()
+	cache.Delete(key)
+}
 
 // Memoizer caches expensive function calls with per-owner tracking.
 // TinyGo variant without singleflight.
@@ -55,7 +86,7 @@ func (m *Memoizer) Do(key string, fn func() (any, error)) (any, error) {
 			value:  data,
 			owners: map[uint64]struct{}{m.ownerID: {}},
 		}
-		actual, loaded := cache.LoadOrStore(key, candidate)
+		actual, loaded := loadOrStore(key, candidate)
 		if !loaded {
 			return data, nil
 		}
@@ -63,7 +94,7 @@ func (m *Memoizer) Do(key string, fn func() (any, error)) (any, error) {
 		if m.addOwner(e) {
 			return e.value, nil
 		}
-		cache.CompareAndDelete(key, e)
+		deleteIfCurrent(key, e)
 	}
 }
 
@@ -90,7 +121,7 @@ func Release(ownerID uint64) {
 		return true
 	})
 	for _, pending := range toDelete {
-		cache.CompareAndDelete(pending.key, pending.entry)
+		deleteIfCurrent(pending.key, pending.entry)
 	}
 }
 
@@ -105,6 +136,6 @@ func Reset() {
 		return true
 	})
 	for _, key := range keys {
-		cache.Delete(key)
+		deleteKey(key)
 	}
 }

@@ -133,6 +133,23 @@ func TestReset(t *testing.T) {
 	}
 }
 
+func TestDeleteIfCurrentPreservesReplacement(t *testing.T) {
+	t.Cleanup(Reset)
+
+	const key = "replaced"
+	old := &entry{value: "old", owners: map[uint64]struct{}{1: {}}}
+	replacement := &entry{value: "replacement", owners: map[uint64]struct{}{2: {}}}
+	cache.Store(key, replacement)
+
+	if deleteIfCurrent(key, old) {
+		t.Fatal("deleting a stale entry should report no deletion")
+	}
+	value, ok := cache.Load(key)
+	if !ok || value != replacement {
+		t.Fatal("deleting a stale entry removed its replacement")
+	}
+}
+
 // cacheLen counts the number of entries in the global cache.
 func cacheLen() int {
 	n := 0
