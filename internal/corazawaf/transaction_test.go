@@ -1193,7 +1193,7 @@ func TestRelevantAuditLoggingWithoutAuditFlag(t *testing.T) {
 // Transaction: when it does, make sure the field is reset on pool reuse, then
 // update wantFields.
 func TestTransactionFieldCount(t *testing.T) {
-	const wantFields = 35
+	const wantFields = 37
 	if got := reflect.TypeFor[Transaction]().NumField(); got != wantFields {
 		t.Fatalf("Transaction has %d fields, want %d. If you added a field, make sure it "+
 			"is reset on pool reuse in newTransaction() (or Close()), then update wantFields.", got, wantFields)
@@ -2677,5 +2677,30 @@ func BenchmarkRuleEvalWithRemovedRules(b *testing.B) {
 
 	for b.Loop() {
 		waf.Rules.Eval(types.PhaseRequestHeaders, tx)
+	}
+}
+
+func TestBytePresenceCacheUsesStringIdentityAndReleasesValues(t *testing.T) {
+	waf := NewWAF()
+	tx := waf.NewTransaction()
+	first := strings.Clone(strings.Repeat("x", 1024))
+	second := strings.Clone(first)
+	present := [4]uint64{1, 2, 3, 4}
+
+	tx.StoreBytePresence(first, present)
+	if cached, found := tx.LoadBytePresence(first); !found || *cached != present {
+		t.Fatalf("unexpected cached byte presence: found %v, value %v", found, cached)
+	}
+	if _, found := tx.LoadBytePresence(second); found {
+		t.Fatal("equal content with different storage must not alias the identity cache")
+	}
+
+	if err := tx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range tx.bytePresenceCache {
+		if entry.value != "" {
+			t.Fatal("closing a pooled transaction must release cached input strings")
+		}
 	}
 }

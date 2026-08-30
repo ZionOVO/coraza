@@ -43,10 +43,12 @@ import (
 // ```
 type rx struct {
 	re           *regexp.Regexp
+	accelerated  acceleratedRegexp
 	minLen       int
 	prefilter    func(string) bool // returns true if regex might match; nil = no prefilter
-	exactMatch   string            // non-empty: pattern is ^literal$; skip NFA entirely
-	exactMatchCI bool              // true when exactMatch uses case-insensitive comparison
+	stateFilter  func(plugintypes.TransactionState, string) bool
+	exactMatch   string // non-empty: pattern is ^literal$; skip NFA entirely
+	exactMatchCI bool   // true when exactMatch uses case-insensitive comparison
 }
 
 // rxCompiled holds all compile-time artifacts for a regex pattern so they can
@@ -54,11 +56,17 @@ type rx struct {
 // multiple rules.
 type rxCompiled struct {
 	re           *regexp.Regexp
+	accelerated  acceleratedRegexp
 	minLen       int
 	prefilter    func(string) bool
+	stateFilter  func(plugintypes.TransactionState, string) bool
 	exactMatch   string
 	exactMatchCI bool
 }
+
+// Inputs below this size are faster with Go's regexp package because they do
+// not amortize the alternate backend's setup and call costs.
+const acceleratedRXMinInputBytes = 512
 
 var _ plugintypes.Operator = (*rx)(nil)
 
@@ -97,10 +105,21 @@ func newRX(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		c := &rxCompiled{re: re}
+		var accelerated acceleratedRegexp
+		if options.RxPreFilterEnabled {
+			accelerated, err = compileAcceleratedRegexp(data)
+			if err != nil {
+				// The accelerator is optional. Every expression accepted by the
+				// established Go backend must remain usable.
+				accelerated = nil
+			}
+		}
+		c := &rxCompiled{re: re, accelerated: accelerated}
 		if options.RxPreFilterEnabled {
 			c.minLen = minMatchLength(data)
-			c.prefilter = prefilterFunc(data)
+			filters := compilePrefilter(data)
+			c.prefilter = filters.match
+			c.stateFilter = filters.matchWithState
 			// Gap 2: detect pure ^literal$ patterns and bypass the NFA entirely.
 			// Parse options.Arguments (the original, un-wrapped pattern) so that
 			// ^ is OpBeginText and $ is OpEndText — without the (?m) flag that
@@ -121,8 +140,10 @@ func newRX(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 	c := compiled.(*rxCompiled)
 	return &rx{
 		re:           c.re,
+		accelerated:  c.accelerated,
 		minLen:       c.minLen,
 		prefilter:    c.prefilter,
+		stateFilter:  c.stateFilter,
 		exactMatch:   c.exactMatch,
 		exactMatchCI: c.exactMatchCI,
 	}, nil
@@ -133,46 +154,57 @@ func (o *rx) Evaluate(tx plugintypes.TransactionState, value string) bool {
 	if len(value) < o.minLen {
 		return false
 	}
-	if o.prefilter != nil && !o.prefilter(value) {
-		return false
-	}
 	// Gap 2: exact-match bypass for patterns like ^Upload$ — skip the NFA entirely.
 	// The \n guard protects against multi-line inputs where (?m)$ matches
 	// before a newline (e.g. "Upload\nmore" would satisfy (?sm)^Upload$).
-	if o.exactMatch != "" && !strings.ContainsRune(value, '\n') {
+	if o.exactMatch != "" && !tx.Capturing() && !strings.ContainsRune(value, '\n') {
 		if o.exactMatchCI {
 			return strings.EqualFold(value, o.exactMatch)
 		}
 		return value == o.exactMatch
+	}
+	if o.stateFilter != nil {
+		if !o.stateFilter(tx, value) {
+			return false
+		}
+	} else if o.prefilter != nil && !o.prefilter(value) {
+		return false
+	}
+
+	// C++ RE2 treats malformed UTF-8 as unmatched input while Go's regexp
+	// exposes each malformed byte as utf8.RuneError. Restrict the alternate
+	// backend to ASCII so matching and capture offsets remain compatible.
+	if o.accelerated != nil && len(value) >= acceleratedRXMinInputBytes && isASCII(value) {
+		if tx.Capturing() {
+			return captureRXMatch(tx, value, o.accelerated.FindStringSubmatchIndex(value))
+		}
+		return o.accelerated.MatchString(value)
 	}
 
 	if tx.Capturing() {
 		// FindStringSubmatchIndex returns a slice of index pairs [start0, end0, start1, end1, ...]
 		// instead of allocating new strings for each capture group. We then slice the original
 		// input value[start:end] to get zero-allocation substrings.
-		match := o.re.FindStringSubmatchIndex(value)
-		if match == nil {
-			return false
-		}
-		// match has 2 entries per group: match[2*i] is the start index,
-		// match[2*i+1] is the end index for capture group i. Group 0 is
-		// the full match, groups 1..N are the parenthesized sub-expressions.
-		for i := 0; i < len(match)/2; i++ {
-			if i == 9 {
-				return true
-			}
-			// A negative start index means the group did not participate in the match
-			// (e.g. an optional group like (foo)? when foo is absent).
-			if match[2*i] >= 0 {
-				tx.CaptureField(i, value[match[2*i]:match[2*i+1]])
-			} else {
-				tx.CaptureField(i, "")
-			}
-		}
-		return true
-	} else {
-		return o.re.MatchString(value)
+		return captureRXMatch(tx, value, o.re.FindStringSubmatchIndex(value))
 	}
+	return o.re.MatchString(value)
+}
+
+func captureRXMatch(tx plugintypes.TransactionState, value string, match []int) bool {
+	if match == nil {
+		return false
+	}
+	for index := 0; index < len(match)/2; index++ {
+		if index == 9 {
+			return true
+		}
+		if match[2*index] >= 0 {
+			tx.CaptureField(index, value[match[2*index]:match[2*index+1]])
+		} else {
+			tx.CaptureField(index, "")
+		}
+	}
+	return true
 }
 
 // binaryRx is exactly the same as rx, but using the binaryregexp package for matching
@@ -186,7 +218,7 @@ var _ plugintypes.Operator = (*binaryRX)(nil)
 func newBinaryRX(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 	data := options.Arguments
 
-	re, err := memoizeDo(options.Memoizer, data, func() (any, error) { return binaryregexp.Compile(data) })
+	re, err := memoizeDo(options.Memoizer, "binary-rx:"+data, func() (any, error) { return binaryregexp.Compile(data) })
 	if err != nil {
 		return nil, err
 	}

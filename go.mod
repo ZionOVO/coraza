@@ -15,6 +15,7 @@ go 1.25.0
 // - gjson
 // - binaryregexp
 // - ocsf-schema-golang
+// - go-re2
 
 require (
 	github.com/anuraaga/go-modsecurity v0.0.0-20220824035035-b9a4099778df
@@ -29,6 +30,7 @@ require (
 	github.com/petar-dambovaliev/aho-corasick v0.0.0-20250424160509-463d218d4745
 	github.com/tidwall/gjson v1.18.0
 	github.com/valllabh/ocsf-schema-golang v1.0.3
+	github.com/wasilibs/go-re2 v1.12.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sync v0.22.0
 	rsc.io/binaryregexp v0.2.0
@@ -44,8 +46,10 @@ require (
 	github.com/miekg/dns v1.1.57 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
+	github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb // indirect
 	golang.org/x/mod v0.40.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

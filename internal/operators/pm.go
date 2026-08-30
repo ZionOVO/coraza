@@ -6,7 +6,11 @@
 package operators
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"strings"
+	"unsafe"
 
 	ahocorasick "github.com/petar-dambovaliev/aho-corasick"
 
@@ -33,10 +37,14 @@ import (
 // SecRule ARGS "@pm <script> javascript: onerror=" "id:171,deny"
 // ```
 type pm struct {
-	matcher ahocorasick.AhoCorasick
-	// minLen is the length of the shortest pattern. If the input is shorter
-	// than this, no pattern can match and we skip the Aho-Corasick automaton.
-	minLen int
+	matcher      ahocorasick.AhoCorasick
+	nonCapturing *indexedMatcher
+	minLen       int
+}
+
+type pmCompiled struct {
+	matcher      ahocorasick.AhoCorasick
+	nonCapturing *indexedMatcher
 }
 
 var _ plugintypes.Operator = (*pm)(nil)
@@ -53,37 +61,72 @@ func newPM(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
 		DFA:                  true,
 	})
 
-	m, _ := memoizeDo(options.Memoizer, data, func() (any, error) { return builder.Build(dict), nil })
+	cacheKey := pmMemoizeKey("pm", "ascii-case-insensitive:leftmost-longest:dfa", dict)
+	compiled, _ := memoizeDo(options.Memoizer, cacheKey, func() (any, error) {
+		artifact := &pmCompiled{matcher: builder.Build(dict)}
+		if !anyEmpty(dict) {
+			artifact.nonCapturing = newIndexedMatcher(dict, true)
+		}
+		return artifact, nil
+	})
 	// TODO this operator is supposed to support snort data syntax: "@pm A|42|C|44|F"
-	return &pm{matcher: m.(ahocorasick.AhoCorasick), minLen: minPatternLen(dict)}, nil
+	artifact := compiled.(*pmCompiled)
+	return &pm{matcher: artifact.matcher, nonCapturing: artifact.nonCapturing, minLen: minPatternLen(dict)}, nil
+}
+
+func pmMemoizeKey(operator, buildOptions string, patterns []string) string {
+	encoded := make([]byte, 0, len(patterns)*8)
+	for _, pattern := range patterns {
+		encoded = binary.BigEndian.AppendUint64(encoded, uint64(len(pattern)))
+		encoded = append(encoded, pattern...)
+	}
+	digest := sha256.Sum256(encoded)
+	return operator + ":" + buildOptions + ":" + hex.EncodeToString(digest[:])
 }
 
 func (o *pm) Evaluate(tx plugintypes.TransactionState, value string) bool {
 	if len(value) < o.minLen {
 		return false
 	}
+	if o.nonCapturing != nil {
+		if !o.nonCapturing.matchWithState(tx, value) {
+			return false
+		}
+		if !tx.Capturing() {
+			return true
+		}
+	}
 	return pmEvaluate(o.matcher, tx, value)
 }
 
-// minPatternLen returns the length of the shortest pattern.
-// If any pattern is empty it returns 0 immediately, disabling short-circuiting:
-// an empty pattern matches every input, so no input can be safely skipped.
-// If there are no patterns, it returns 0.
 func minPatternLen(patterns []string) int {
-	min := 0
-	for _, p := range patterns {
-		if len(p) == 0 {
+	minimum := 0
+	for _, pattern := range patterns {
+		if len(pattern) == 0 {
 			return 0
 		}
-		if min == 0 || len(p) < min {
-			min = len(p)
+		if minimum == 0 || len(pattern) < minimum {
+			minimum = len(pattern)
 		}
 	}
-	return min
+	return minimum
+}
+
+func anyEmpty(values []string) bool {
+	for _, value := range values {
+		if value == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func pmEvaluate(matcher ahocorasick.AhoCorasick, tx plugintypes.TransactionState, value string) bool {
-	iter := matcher.Iter(value)
+	// Aho-Corasick stores the haystack in its iterator, so Iter converts the
+	// complete string to a copied byte slice. The matcher never mutates the
+	// haystack; a read-only view avoids copying large request bodies per rule.
+	valueBytes := unsafe.Slice(unsafe.StringData(value), len(value))
+	iter := matcher.IterByte(valueBytes)
 
 	if !tx.Capturing() {
 		// Not capturing so just one match is enough.

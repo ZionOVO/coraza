@@ -64,9 +64,17 @@ func newPMFromFile(options plugintypes.OperatorOptions) (plugintypes.Operator, e
 		DFA:                  false,
 	})
 
-	m, _ := memoizeDo(options.Memoizer, strings.Join(options.Path, ",")+filepath, func() (any, error) { return builder.Build(lines), nil })
+	cacheKey := pmMemoizeKey("pm-from-file", "ascii-case-insensitive:leftmost-longest:nfa", lines)
+	compiled, _ := memoizeDo(options.Memoizer, cacheKey, func() (any, error) {
+		artifact := &pmCompiled{matcher: builder.Build(lines)}
+		if !anyEmpty(lines) {
+			artifact.nonCapturing = newIndexedMatcher(lines, true)
+		}
+		return artifact, nil
+	})
 
-	return &pm{matcher: m.(ahocorasick.AhoCorasick), minLen: minPatternLen(lines)}, nil
+	artifact := compiled.(*pmCompiled)
+	return &pm{matcher: artifact.matcher, nonCapturing: artifact.nonCapturing, minLen: minPatternLen(lines)}, nil
 }
 
 func init() {

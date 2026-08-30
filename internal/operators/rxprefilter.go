@@ -72,6 +72,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
 // minMatchLength computes the minimum number of bytes an input must have
@@ -151,10 +153,77 @@ func minLen(re *syntax.Regexp) int {
 	}
 }
 
-// prefilterFunc returns a function that returns true if the regex might match
-// the input, false if it definitely cannot. Returns nil when no useful
-// prefilter can be built.
+type compiledPrefilter struct {
+	match          func(string) bool
+	matchWithState func(plugintypes.TransactionState, string) bool
+}
+
+// prefilterFunc returns a stateless necessary-condition check for a regular
+// expression. Callers with transaction state should use compilePrefilter.
 func prefilterFunc(pattern string) func(string) bool {
+	return compilePrefilter(pattern).match
+}
+
+func compilePrefilter(pattern string) compiledPrefilter {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return compiledPrefilter{}
+	}
+	re = re.Simplify()
+	caseInsensitive := hasFlag(re, syntax.FoldCase)
+	literals := extractLiterals(re, caseInsensitive)
+	if caseInsensitive && literals != nil && !extractedLiteralsAreASCII(literals) {
+		return compiledPrefilter{}
+	}
+
+	match := buildPrefilterFunc(pattern)
+	if match == nil || literals == nil {
+		return compiledPrefilter{match: match}
+	}
+
+	var needles []string
+	switch values := literals.(type) {
+	case allRequired:
+		if literal := longest(values); literal != "" {
+			needles = []string{literal}
+		}
+	case anyRequired:
+		needles = values
+	case combinedRequired:
+		if literal := longest(values.all); literal != "" {
+			needles = []string{literal}
+		} else {
+			needles = values.any
+		}
+	}
+	if len(needles) == 0 {
+		return compiledPrefilter{match: match}
+	}
+	required := newRequiredByteMatcher(needles, caseInsensitive)
+	return compiledPrefilter{
+		match: match,
+		matchWithState: func(tx plugintypes.TransactionState, value string) bool {
+			return required.matchWithState(tx, value) && match(value)
+		},
+	}
+}
+
+func extractedLiteralsAreASCII(literals any) bool {
+	switch values := literals.(type) {
+	case allRequired:
+		return allASCIIStrings(values)
+	case anyRequired:
+		return allASCIIStrings(values)
+	case combinedRequired:
+		return allASCIIStrings(values.all) && allASCIIStrings(values.any)
+	default:
+		return false
+	}
+}
+
+// buildPrefilterFunc returns a function that returns true if the regex might
+// match the input, false if it definitely cannot.
+func buildPrefilterFunc(pattern string) func(string) bool {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -742,6 +811,170 @@ func filterShort(ss []string, minLen int) []string {
 // Raise if profiling shows Wu-Manber still wins beyond that.
 const anyRequiredMaxN = 256
 
+// requiredByteMatcher checks a necessary byte set before an indexed search.
+// The selected set intersects every candidate literal, so absence proves that
+// none of the literals can match while presence remains only a maybe-match.
+type requiredByteMatcher struct {
+	bytes      [256]bool
+	bits       [4]uint64
+	characters string
+	ascii      bool
+}
+
+type bytePresenceCache interface {
+	LoadBytePresence(string) (*[4]uint64, bool)
+	StoreBytePresence(string, [4]uint64)
+}
+
+const cachedBytePresenceMinInputBytes = 512
+
+func newRequiredByteMatcher(needles []string, caseFold bool) *requiredByteMatcher {
+	groups := make([][]byte, 0, len(needles))
+	for _, needle := range needles {
+		var present [256]bool
+		group := make([]byte, 0, len(needle))
+		for index := range len(needle) {
+			value := needle[index]
+			if !present[value] {
+				present[value] = true
+				group = append(group, value)
+			}
+		}
+		groups = append(groups, group)
+	}
+
+	matcher := &requiredByteMatcher{}
+	covered := make([]bool, len(groups))
+	remaining := len(groups)
+	for remaining > 0 {
+		var counts [256]int
+		for index, group := range groups {
+			if covered[index] {
+				continue
+			}
+			for _, value := range group {
+				counts[value]++
+			}
+		}
+		best := byte(0)
+		for value := 1; value < len(counts); value++ {
+			if counts[value] > counts[best] || counts[value] == counts[best] && byteRarity(byte(value)) > byteRarity(best) {
+				best = byte(value)
+			}
+		}
+		matcher.add(best, caseFold)
+		for index, group := range groups {
+			if covered[index] || !containsByte(group, best) {
+				continue
+			}
+			covered[index] = true
+			remaining--
+		}
+	}
+	var characters strings.Builder
+	matcher.ascii = true
+	for value, selected := range matcher.bytes {
+		if !selected {
+			continue
+		}
+		if value >= utf8.RuneSelf {
+			matcher.ascii = false
+			break
+		}
+		characters.WriteByte(byte(value))
+	}
+	if matcher.ascii {
+		matcher.characters = characters.String()
+	}
+	return matcher
+}
+
+func byteRarity(value byte) int {
+	switch value {
+	case 'e', 't', 'a', 'o', 'i', 'n', 's', 'h', 'r':
+		return 0
+	case 'd', 'l', 'u', 'c', 'm', 'f', 'y', 'w', 'g', 'p', 'b', 'v':
+		return 1
+	case 'k', 'j', 'q', 'x', 'z':
+		return 2
+	default:
+		return 3
+	}
+}
+
+func (matcher *requiredByteMatcher) match(value string) bool {
+	if matcher.ascii {
+		return strings.ContainsAny(value, matcher.characters)
+	}
+	for index := range len(value) {
+		if matcher.bytes[value[index]] {
+			return true
+		}
+	}
+	return false
+}
+
+func (matcher *requiredByteMatcher) matchWithState(tx plugintypes.TransactionState, value string) bool {
+	cache, ok := tx.(bytePresenceCache)
+	if !ok || len(value) < cachedBytePresenceMinInputBytes {
+		return matcher.match(value)
+	}
+	if present, found := cache.LoadBytePresence(value); found {
+		for index := range matcher.bits {
+			if present[index]&matcher.bits[index] != 0 {
+				return true
+			}
+		}
+		return false
+	}
+	if matcher.match(value) {
+		return true
+	}
+	var present [4]uint64
+	for index := range len(value) {
+		current := value[index]
+		present[current>>6] |= uint64(1) << (current & 63)
+	}
+	cache.StoreBytePresence(value, present)
+	return false
+}
+
+func (matcher *requiredByteMatcher) possibleFromCache(tx plugintypes.TransactionState, value string) bool {
+	cache, ok := tx.(bytePresenceCache)
+	if !ok || len(value) < cachedBytePresenceMinInputBytes {
+		return true
+	}
+	present, found := cache.LoadBytePresence(value)
+	if !found {
+		return true
+	}
+	for index := range matcher.bits {
+		if present[index]&matcher.bits[index] != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (matcher *requiredByteMatcher) add(value byte, caseFold bool) {
+	matcher.bytes[value] = true
+	matcher.bits[value>>6] |= uint64(1) << (value & 63)
+	if caseFold && value >= 'a' && value <= 'z' {
+		upper := value - ('a' - 'A')
+		matcher.bytes[upper] = true
+		matcher.bits[upper>>6] |= uint64(1) << (upper & 63)
+	}
+}
+
+func containsByte(values []byte, target byte) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 // indexedMatcher performs sub-linear multi-pattern substring matching using a
 // Wu-Manber style shift table. Instead of examining every byte in the haystack,
 // it slides a window of size minLen and looks at the byte at the window's right
@@ -763,6 +996,7 @@ type indexedMatcher struct {
 	endBuckets [256][]string // needles grouped by their byte at position minLen-1
 	minLen     int
 	ci         bool
+	required   *requiredByteMatcher
 }
 
 func newIndexedMatcher(needles []string, ci bool) *indexedMatcher {
@@ -794,6 +1028,7 @@ func newIndexedMatcher(needles []string, ci bool) *indexedMatcher {
 			norms[i] = strings.ToLower(n)
 		}
 	}
+	im.required = newRequiredByteMatcher(norms, ci)
 
 	for _, n := range norms {
 		for j := 0; j < im.minLen; j++ {
@@ -824,6 +1059,13 @@ func (m *indexedMatcher) match(s string) bool {
 		return m.matchCI(s)
 	}
 	return m.matchCS(s)
+}
+
+func (m *indexedMatcher) matchWithState(tx plugintypes.TransactionState, value string) bool {
+	if m.required != nil && !m.required.possibleFromCache(tx, value) {
+		return false
+	}
+	return m.match(value)
 }
 
 func (m *indexedMatcher) matchCS(s string) bool {
