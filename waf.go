@@ -179,7 +179,8 @@ func (w wafWrapper) RulesCount() int {
 	return w.waf.Rules.Count()
 }
 
-// Close releases cached resources owned by this WAF instance.
+// Close releases cached resources and internally opened log files owned by this WAF instance.
+// Call Close after all transactions created by the WAF have finished.
 func (w wafWrapper) Close() error {
 	return w.waf.Close()
 }

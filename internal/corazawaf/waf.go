@@ -152,6 +152,7 @@ type WAF struct {
 	AuditLogWriterConfig plugintypes.AuditLogConfig
 
 	auditLogWriterInitialized bool
+	debugLogCloser            io.Closer
 
 	// Configures the maximum number of ARGS that will be accepted for processing.
 	ArgumentLimit int
@@ -163,6 +164,7 @@ type WAF struct {
 	memoizerID uint64
 	memoizer   *memoize.Memoizer
 	closeOnce  gosync.Once
+	closeErr   error
 }
 
 // Options is used to pass options to the WAF instance
@@ -281,33 +283,36 @@ func (w *WAF) newTransaction(opts Options) *Transaction {
 	return tx
 }
 
-func resolveLogPath(path string) (io.Writer, error) {
+func resolveLogPath(path string) (io.Writer, io.Closer, error) {
 	if path == "" {
-		return io.Discard, nil
+		return io.Discard, nil, nil
 	}
 
 	if path == "/dev/stdout" {
-		return os.Stdout, nil
+		return os.Stdout, nil, nil
 	}
 
 	if path == "/dev/stderr" {
-		return os.Stderr, nil
+		return os.Stderr, nil, nil
 	}
 
-	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, f, nil
 }
 
 // SetDebugLogPath sets the path for the debug log
 // If the path is empty, the debug log will be disabled
 // note: this is not thread safe
 func (w *WAF) SetDebugLogPath(path string) error {
-	o, err := resolveLogPath(path)
+	o, closer, err := resolveLogPath(path)
 	if err != nil {
 		return err
 	}
 
-	w.SetDebugLogOutput(o)
-	return nil
+	return w.replaceDebugLogOutput(o, closer)
 }
 
 const _1gib = 1073741824
@@ -363,7 +368,19 @@ func NewWAF() *WAF {
 }
 
 func (w *WAF) SetDebugLogOutput(wr io.Writer) {
+	if err := w.replaceDebugLogOutput(wr, nil); err != nil {
+		w.Logger.Error().Err(err).Msg("Failed to close previous debug log")
+	}
+}
+
+func (w *WAF) replaceDebugLogOutput(wr io.Writer, closer io.Closer) error {
+	previous := w.debugLogCloser
 	w.Logger = w.Logger.WithOutput(wr)
+	w.debugLogCloser = closer
+	if previous != nil {
+		return previous.Close()
+	}
+	return nil
 }
 
 // SetDebugLogLevel changes the debug level of the WAF instance
@@ -378,6 +395,12 @@ func (w *WAF) SetDebugLogLevel(lvl debuglog.Level) error {
 
 // SetAuditLogWriter sets the audit log writer
 func (w *WAF) SetAuditLogWriter(alw plugintypes.AuditLogWriter) {
+	if w.auditLogWriterInitialized {
+		if err := w.auditLogWriter.Close(); err != nil {
+			w.Logger.Error().Err(err).Msg("Failed to close previous audit log writer")
+		}
+		w.auditLogWriterInitialized = false
+	}
 	w.auditLogWriter = alw
 }
 
@@ -387,6 +410,8 @@ func (w *WAF) AuditLogWriter() plugintypes.AuditLogWriter {
 	if !w.auditLogWriterInitialized {
 		if err := w.auditLogWriter.Init(w.AuditLogWriterConfig); err != nil {
 			w.Logger.Error().Err(err).Msg("Failed to initialize audit log")
+		} else {
+			w.auditLogWriterInitialized = true
 		}
 	}
 
@@ -479,12 +504,22 @@ func (w *WAF) Memoizer() *memoize.Memoizer {
 	return w.memoizer
 }
 
-// Close releases cached resources owned by this WAF instance.
+// Close releases cached resources and internally opened log files owned by this WAF instance.
 // Cached entries shared with other WAF instances remain until all owners release them.
-// Transactions already in-flight are unaffected as they hold their own references.
+// Call Close after all transactions created by the WAF have finished.
 func (w *WAF) Close() error {
 	w.closeOnce.Do(func() {
+		if w.auditLogWriterInitialized {
+			if err := w.auditLogWriter.Close(); err != nil {
+				w.closeErr = errors.Join(w.closeErr, fmt.Errorf("close audit log writer: %w", err))
+			}
+		}
+		if w.debugLogCloser != nil {
+			if err := w.debugLogCloser.Close(); err != nil {
+				w.closeErr = errors.Join(w.closeErr, fmt.Errorf("close debug log: %w", err))
+			}
+		}
 		memoize.Release(w.memoizerID)
 	})
-	return nil
+	return w.closeErr
 }

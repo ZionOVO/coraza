@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -53,6 +55,20 @@ func TestNewWAFFailureReleasesMemoizedPatterns(t *testing.T) {
 	}
 	if !compiled {
 		t.Fatal("failed WAF retained ownership of a compiled pattern")
+	}
+}
+
+func TestNewWAFFailureClosesOwnedDebugLog(t *testing.T) {
+	debugLogPath := filepath.Join(t.TempDir(), "debug.log")
+	_, err := NewWAF(NewWAFConfig().WithDirectives(fmt.Sprintf(`
+SecDebugLog %s
+SecRule
+`, filepath.ToSlash(debugLogPath))))
+	if err == nil {
+		t.Fatal("expected invalid directives to fail")
+	}
+	if err := os.Remove(debugLogPath); err != nil {
+		t.Fatalf("remove debug log after failed WAF construction: %v", err)
 	}
 }
 

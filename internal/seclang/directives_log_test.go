@@ -22,6 +22,11 @@ import (
 
 func TestSecAuditLogDirectivesConcurrent(t *testing.T) {
 	waf := corazawaf.NewWAF()
+	defer func() {
+		if err := waf.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	parser := NewParser(waf)
 
 	auditpath := t.TempDir()
@@ -66,6 +71,11 @@ func TestSecAuditLogDirectivesConcurrent(t *testing.T) {
 
 func TestDebugDirectives(t *testing.T) {
 	waf := corazawaf.NewWAF()
+	defer func() {
+		if err := waf.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	tmp := filepath.Join(t.TempDir(), "tmp.log")
 	p := NewParser(waf)
 	err := directiveSecDebugLog(&DirectiveOptions{
