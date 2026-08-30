@@ -133,6 +133,11 @@ func newYufengFullWAF(tb testing.TB) coraza.WAF {
 	return newYufengWAFWithDirectives(tb, yufengFullDirectives)
 }
 
+func newYufengFullReferenceWAF(tb testing.TB) coraza.WAF {
+	directives := strings.Replace(yufengFullDirectives, "SecRxPreFilter On", "SecRxPreFilter Off", 1)
+	return newYufengWAFWithDirectives(tb, directives)
+}
+
 func newYufengWAFWithDirectives(tb testing.TB, directives string) coraza.WAF {
 	tb.Helper()
 	waf := newUnmanagedYufengWAFWithDirectives(tb, directives)
@@ -166,6 +171,14 @@ func closeYufengWAF(tb testing.TB, waf coraza.WAF) {
 }
 
 func processYufengRequest(waf coraza.WAF, request yufengRequest) ([]int, error) {
+	return processYufengRequestRuleIDs(waf, request, false)
+}
+
+func processYufengRequestAllRuleIDs(waf coraza.WAF, request yufengRequest) ([]int, error) {
+	return processYufengRequestRuleIDs(waf, request, true)
+}
+
+func processYufengRequestRuleIDs(waf coraza.WAF, request yufengRequest, includeAll bool) ([]int, error) {
 	tx := waf.NewTransaction()
 	closeWithError := func(cause error) error {
 		if err := tx.Close(); err != nil {
@@ -200,7 +213,7 @@ func processYufengRequest(waf coraza.WAF, request yufengRequest) ([]int, error) 
 	ids := make([]int, 0, len(matched))
 	for _, match := range matched {
 		id := match.Rule().ID()
-		if id >= 930000 && id < 950000 && strings.TrimSpace(match.Message()) != "" {
+		if includeAll || id >= 930000 && id < 950000 && strings.TrimSpace(match.Message()) != "" {
 			ids = append(ids, id)
 		}
 	}
@@ -253,6 +266,59 @@ func TestYufengCRSRepresentativeDetections(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestYufengFullCRSAcceleratedDetectionsMatchReference(t *testing.T) {
+	acceleratedWAF := newYufengFullWAF(t)
+	referenceWAF := newYufengFullReferenceWAF(t)
+	tests := []struct {
+		name          string
+		request       yufengRequest
+		requireAttack bool
+	}{
+		{name: "read_no_body", request: yufengRequest{method: "GET", uri: "/api/items?page=2"}},
+		{name: "json_4_kib_benign", request: benchmarkJSONRequest(4 << 10)},
+		{name: "json_4_kib_attack_head", request: injectYufengSQLAttack(benchmarkJSONRequest(4<<10), true), requireAttack: true},
+		{name: "json_4_kib_attack_tail", request: injectYufengSQLAttack(benchmarkJSONRequest(4<<10), false), requireAttack: true},
+		{name: "natural_text_64_kib_benign", request: benchmarkNaturalTextRequest(yufengBodyLimit)},
+		{name: "natural_text_64_kib_attack_head", request: injectYufengSQLAttack(benchmarkNaturalTextRequest(yufengBodyLimit), true), requireAttack: true},
+		{name: "natural_text_64_kib_attack_tail", request: injectYufengSQLAttack(benchmarkNaturalTextRequest(yufengBodyLimit), false), requireAttack: true},
+		{name: "base64_64_kib_benign", request: benchmarkBase64Request(yufengBodyLimit)},
+		{name: "base64_64_kib_attack_head", request: injectYufengSQLAttack(benchmarkBase64Request(yufengBodyLimit), true), requireAttack: true},
+		{name: "base64_64_kib_attack_tail", request: injectYufengSQLAttack(benchmarkBase64Request(yufengBodyLimit), false), requireAttack: true},
+		{name: "binary_64_kib_benign", request: benchmarkBinaryRequest(yufengBodyLimit)},
+		{name: "binary_64_kib_attack_head", request: injectYufengSQLAttack(benchmarkBinaryRequest(yufengBodyLimit), true), requireAttack: true},
+		{name: "binary_64_kib_attack_tail", request: injectYufengSQLAttack(benchmarkBinaryRequest(yufengBodyLimit), false), requireAttack: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			acceleratedIDs, err := processYufengRequestAllRuleIDs(acceleratedWAF, test.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			referenceIDs, err := processYufengRequestAllRuleIDs(referenceWAF, test.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			slices.Sort(acceleratedIDs)
+			slices.Sort(referenceIDs)
+			if !slices.Equal(acceleratedIDs, referenceIDs) {
+				t.Fatalf("accelerated detections differ from the Go backend: accelerated %v, reference %v", acceleratedIDs, referenceIDs)
+			}
+			if test.requireAttack && !containsYufengRuleIDInRange(acceleratedIDs, 942000, 943000) {
+				t.Fatalf("SQL injection detection is absent from %v", acceleratedIDs)
+			}
+		})
+	}
+}
+
+func containsYufengRuleIDInRange(ids []int, start, end int) bool {
+	for _, id := range ids {
+		if id >= start && id < end {
+			return true
+		}
+	}
+	return false
 }
 
 func TestYufengWAFMemoryFootprint(t *testing.T) {
@@ -522,4 +588,21 @@ func benchmarkAttackRequest(atHead bool) yufengRequest {
 	}
 	copy(body[position:], payload)
 	return yufengRequest{method: "POST", uri: "/upload/blob?page=2", contentType: "application/octet-stream", body: body}
+}
+
+func injectYufengSQLAttack(request yufengRequest, atHead bool) yufengRequest {
+	payload := []byte("id=1+UNION+SELECT+password+FROM+users")
+	request.body = slices.Clone(request.body)
+	start := 0
+	end := len(request.body)
+	if request.contentType == "application/json" {
+		start = len(`{"value":"`)
+		end -= len(`"}`)
+	}
+	position := start
+	if !atHead {
+		position = end - len(payload)
+	}
+	copy(request.body[position:], payload)
+	return request
 }
