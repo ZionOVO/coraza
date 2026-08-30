@@ -32,6 +32,12 @@ func NewWAF(config WAFConfig) (WAF, error) {
 	c := config.(*wafConfig)
 
 	waf := corazawaf.NewWAF()
+	initialized := false
+	defer func() {
+		if !initialized {
+			waf.Close()
+		}
+	}()
 
 	if environment.HasAccessToFS {
 		if err := environment.IsDirWritable(waf.TmpDir); err != nil {
@@ -120,6 +126,7 @@ func NewWAF(config WAFConfig) (WAF, error) {
 		return nil, err
 	}
 
+	initialized = true
 	return wafWrapper{waf: waf}, nil
 }
 
@@ -172,7 +179,8 @@ func (w wafWrapper) RulesCount() int {
 	return w.waf.Rules.Count()
 }
 
-// Close releases cached resources owned by this WAF instance.
+// Close releases cached resources and internally opened log files owned by this WAF instance.
+// Call Close after all transactions created by the WAF have finished.
 func (w wafWrapper) Close() error {
 	return w.waf.Close()
 }

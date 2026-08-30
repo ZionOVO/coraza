@@ -12,8 +12,14 @@ var Noop collection.Collection = &noop{}
 
 type noop struct{}
 
+var _ MatchAppender = &noop{}
+
 func (c *noop) FindAll() []types.MatchData {
 	return nil
+}
+
+func (c *noop) AppendMatches(result []Match) []Match {
+	return result
 }
 
 func (c *noop) Name() string {

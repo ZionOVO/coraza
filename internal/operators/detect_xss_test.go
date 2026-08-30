@@ -6,6 +6,8 @@ package operators
 import (
 	"testing"
 
+	"github.com/corazawaf/libinjection-go"
+
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
 )
 
@@ -26,6 +28,10 @@ func FuzzXSS(f *testing.F) {
 	f.Fuzz(func(t *testing.T, tc string) {
 		tx := waf.NewTransaction()
 		defer tx.Close()
-		_ = xss.Evaluate(tx, tc)
+		have := xss.Evaluate(tx, tc)
+		want := libinjection.IsXSS(tc)
+		if have != want {
+			t.Fatalf("prefilter changed cross-site scripting result for %q: want %v, have %v", tc, want, have)
+		}
 	})
 }

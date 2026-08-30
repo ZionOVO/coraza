@@ -1,6 +1,8 @@
 // Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build !coraza.disabled_operators.rx
+
 package operators
 
 import (
@@ -146,6 +148,8 @@ func TestPrefilterNeverCausesFalseNegatives(t *testing.T) {
 		// Anchored, unicode, wildcard literal
 		{"^hello", "hello world", true},
 		{"^hello", "say hello", false},
+		{"^.00", "100", true},
+		{"00.$", "001", true},
 		{"ハロー", "ハローワールド", true},
 		{"ハロー", "グッバイ", false},
 		{".*\\.exe", "malware.exe", true},
@@ -664,6 +668,18 @@ func TestPrefilterUnicodeFoldingSafety(t *testing.T) {
 			input:   "o\u212a",
 			matches: true,
 		},
+		{
+			name:    "long_s_pattern_ascii_input",
+			pattern: "(?i)ſ",
+			input:   "s",
+			matches: true,
+		},
+		{
+			name:    "kelvin_pattern_ascii_input",
+			pattern: "(?i)\u212a",
+			input:   "k",
+			matches: true,
+		},
 		// Mixed: non-ASCII input but no fold relevance (should still be safe)
 		{
 			name:    "unrelated_non_ascii",
@@ -961,6 +977,8 @@ func FuzzPrefilterNoFalseNegatives(f *testing.F) {
 	patterns := []string{
 		"hello",
 		"hello.*world",
+		"^.00",
+		"00.$",
 		"(?i)(?:union\\s+select|insert\\s+into)",
 		"(?:;|\\|)\\s*(?:cat|ls|id|whoami)",
 		"(?i)<script[^>]*>",

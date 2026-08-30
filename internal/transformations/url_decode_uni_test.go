@@ -90,11 +90,12 @@ func BenchmarkInplaceUniDecode(b *testing.B) {
 }
 
 func BenchmarkURLDecode(b *testing.B) {
-	tests := []string{
-		"",
-		"helloworld",
-		"hello+world",
-		"%E3%83%8F%E3%83%AD%E3%83%BC%E3%83%AF%E3%83%BC%E3%83%AB%E3%83%89",
+	tests := map[string]string{
+		"empty":                 "",
+		"plain":                 "helloworld",
+		"plus":                  "hello+world",
+		"encoded":               "%E3%83%8F%E3%83%AD%E3%83%BC%E3%83%AF%E3%83%BC%E3%83%AB%E3%83%89",
+		"large_unicode_escapes": strings.Repeat("\x01\x02\x03\x04%ufffd%ufffd%ufffd%ufffd", 8<<10),
 	}
 
 	for _, mode := range []string{"normal", "unicode"} {
@@ -102,11 +103,12 @@ func BenchmarkURLDecode(b *testing.B) {
 		if mode == "unicode" {
 			f = urlDecodeUni
 		}
-		for _, tc := range tests {
-			tt := tc
-			b.Run(fmt.Sprintf("%s/%s", mode, tt), func(b *testing.B) {
-				for i := 0; i < b.N; i++ {
-					if _, _, err := f(tt); err != nil {
+		for name, input := range tests {
+			b.Run(fmt.Sprintf("%s/%s", mode, name), func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(input)))
+				for range b.N {
+					if _, _, err := f(input); err != nil {
 						b.Fatal(err)
 					}
 				}

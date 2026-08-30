@@ -5,12 +5,15 @@ package corazawaf
 
 import (
 	"errors"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/corazawaf/coraza/v3/debuglog"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/macro"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
+	"github.com/corazawaf/coraza/v3/internal/collections"
 	"github.com/corazawaf/coraza/v3/internal/corazarules"
 	"github.com/corazawaf/coraza/v3/types"
 	"github.com/corazawaf/coraza/v3/types/variables"
@@ -272,6 +275,15 @@ type dummyEqOperator struct{}
 
 func (*dummyEqOperator) Evaluate(_ plugintypes.TransactionState, value string) bool {
 	return value == "0"
+}
+
+type recordingOperator struct {
+	inputs []string
+}
+
+func (o *recordingOperator) Evaluate(_ plugintypes.TransactionState, value string) bool {
+	o.inputs = append(o.inputs, value)
+	return false
 }
 
 func TestSecActionMessagePropagationInMatchData(t *testing.T) {
@@ -610,6 +622,160 @@ func TestExecuteTransformationsMultiMatchReturnsMultipleErrors(t *testing.T) {
 	}
 }
 
+func TestTransformFieldMultimatchCachesEveryOperatorInput(t *testing.T) {
+	var transformationInputs []string
+	expectedError := errors.New("transformation failed")
+	record := func(transform plugintypes.Transformation) plugintypes.Transformation {
+		return func(input string) (string, bool, error) {
+			transformationInputs = append(transformationInputs, input)
+			return transform(input)
+		}
+	}
+
+	rule := NewRule()
+	_ = rule.AddTransformation("multiMatchAppendA", record(func(input string) (string, bool, error) {
+		return input + "A", true, nil
+	}))
+	_ = rule.AddTransformation("multiMatchUnchanged", record(func(input string) (string, bool, error) {
+		return input + "ignored", false, nil
+	}))
+	_ = rule.AddTransformation("multiMatchError", record(func(input string) (string, bool, error) {
+		return input + "ignored", true, expectedError
+	}))
+	_ = rule.AddTransformation("multiMatchAppendB", record(func(input string) (string, bool, error) {
+		return input + "B", true, nil
+	}))
+
+	input := strings.Repeat("x", cachedTransformationStepMinInputBytes)
+	field := collections.Match{Variable: variables.RequestURI, Key: "REQUEST_URI", Value: input}
+	cache := map[transformationKey]transformationValue{}
+	wantValues := []string{input, input + "A", input + "AB"}
+	wantTransformationInputs := []string{input, input + "A", input + "A", input + "A"}
+
+	values, errs := rule.transformFieldMultimatch(field, 0, cache, nil)
+	if !slices.Equal(values, wantValues) {
+		t.Fatalf("first evaluation values = %q, want %q", values, wantValues)
+	}
+	if !slices.Equal(transformationInputs, wantTransformationInputs) {
+		t.Fatalf("transformation inputs = %q, want %q", transformationInputs, wantTransformationInputs)
+	}
+	if len(errs) != 1 || !errors.Is(errs[0], expectedError) {
+		t.Fatalf("first evaluation errors = %v, want %v", errs, expectedError)
+	}
+	if len(cache) != len(rule.transformations) {
+		t.Fatalf("cache entries = %d, want %d", len(cache), len(rule.transformations))
+	}
+
+	transformationInputs = nil
+	values, errs = rule.transformFieldMultimatch(field, 0, cache, values[:0])
+	if !slices.Equal(values, wantValues) {
+		t.Fatalf("cached evaluation values = %q, want %q", values, wantValues)
+	}
+	if len(transformationInputs) != 0 {
+		t.Fatalf("cached evaluation unexpectedly executed transformations with inputs %q", transformationInputs)
+	}
+	if len(errs) != 1 || !errors.Is(errs[0], expectedError) {
+		t.Fatalf("cached evaluation errors = %v, want %v", errs, expectedError)
+	}
+}
+
+func TestTransformFieldMultimatchReusesSharedPrefix(t *testing.T) {
+	appendACalls := 0
+	appendBCalls := 0
+	appendA := func(input string) (string, bool, error) {
+		appendACalls++
+		return input + "A", true, nil
+	}
+	appendB := func(input string) (string, bool, error) {
+		appendBCalls++
+		return input + "B", true, nil
+	}
+
+	shortRule := NewRule()
+	_ = shortRule.AddTransformation("multiMatchSharedAppendA", appendA)
+	longRule := NewRule()
+	_ = longRule.AddTransformation("multiMatchSharedAppendA", appendA)
+	_ = longRule.AddTransformation("multiMatchSharedAppendB", appendB)
+	input := strings.Repeat("x", cachedTransformationStepMinInputBytes)
+	field := collections.Match{Variable: variables.RequestURI, Key: "REQUEST_URI", Value: input}
+	cache := map[transformationKey]transformationValue{}
+
+	if values, errs := shortRule.transformFieldMultimatch(field, 0, cache, nil); !slices.Equal(values, []string{input, input + "A"}) || len(errs) != 0 {
+		t.Fatalf("short rule values = %q, errors = %v", values, errs)
+	}
+	if values, errs := longRule.transformFieldMultimatch(field, 0, cache, nil); !slices.Equal(values, []string{input, input + "A", input + "AB"}) || len(errs) != 0 {
+		t.Fatalf("long rule values = %q, errors = %v", values, errs)
+	}
+	if appendACalls != 1 || appendBCalls != 1 {
+		t.Fatalf("transformation calls = (%d, %d), want (1, 1)", appendACalls, appendBCalls)
+	}
+}
+
+func TestTransformFieldMultimatchDoesNotCacheTX(t *testing.T) {
+	calls := 0
+	rule := NewRule()
+	_ = rule.AddTransformation("multiMatchTXAppendA", func(input string) (string, bool, error) {
+		calls++
+		return input + "A", true, nil
+	})
+	cache := map[transformationKey]transformationValue{}
+
+	first := collections.Match{Variable: variables.TX, Key: "mutable", Value: "first"}
+	second := collections.Match{Variable: variables.TX, Key: "mutable", Value: "second"}
+	if values, _ := rule.transformFieldMultimatch(first, 0, cache, nil); !slices.Equal(values, []string{"first", "firstA"}) {
+		t.Fatalf("first values = %q", values)
+	}
+	if values, _ := rule.transformFieldMultimatch(second, 0, cache, nil); !slices.Equal(values, []string{"second", "secondA"}) {
+		t.Fatalf("second values = %q", values)
+	}
+	if calls != 2 || len(cache) != 0 {
+		t.Fatalf("transformation calls = %d, cache entries = %d, want 2 and 0", calls, len(cache))
+	}
+}
+
+func TestMultiMatchOperatorInputOrderSurvivesTransformationCacheHit(t *testing.T) {
+	transformationCalls := 0
+	rule := NewRule()
+	rule.ID_ = 1
+	rule.LogID_ = "1"
+	rule.MultiMatch = true
+	if err := rule.AddVariable(variables.RequestURI, "", false); err != nil {
+		t.Fatal(err)
+	}
+	_ = rule.AddTransformation("multiMatchOperatorAppendA", func(input string) (string, bool, error) {
+		transformationCalls++
+		return input + "A", true, nil
+	})
+	_ = rule.AddTransformation("multiMatchOperatorUnchanged", func(input string) (string, bool, error) {
+		transformationCalls++
+		return input, false, nil
+	})
+	_ = rule.AddTransformation("multiMatchOperatorAppendB", func(input string) (string, bool, error) {
+		transformationCalls++
+		return input + "B", true, nil
+	})
+	operator := &recordingOperator{}
+	rule.SetOperator(operator, "@record", "")
+
+	tx := NewWAF().NewTransaction()
+	input := strings.Repeat("x", cachedTransformationStepMinInputBytes)
+	tx.variables.requestURI.Set(input)
+	var matchedValues []types.MatchData
+	rule.doEvaluate(debuglog.Noop(), types.PhaseRequestHeaders, tx, &matchedValues, 0, tx.transformationCache)
+	rule.doEvaluate(debuglog.Noop(), types.PhaseRequestHeaders, tx, &matchedValues, 0, tx.transformationCache)
+
+	wantInputs := []string{input, input + "A", input + "AB", input, input + "A", input + "AB"}
+	if !slices.Equal(operator.inputs, wantInputs) {
+		t.Fatalf("operator inputs = %q, want %q", operator.inputs, wantInputs)
+	}
+	if transformationCalls != 3 {
+		t.Fatalf("transformation calls = %d, want 3", transformationCalls)
+	}
+	if err := tx.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTransformArgSimple(t *testing.T) {
 	transformationCache := map[transformationKey]transformationValue{}
 	md := &corazarules.MatchData{
@@ -707,6 +873,165 @@ func TestTransformArgPrefixSharing(t *testing.T) {
 	// Should now have 2 entries: AppendA (shared) and AppendA+AppendB
 	if len(transformationCache) != 2 {
 		t.Errorf("Expected 2 cache entries after rule2 (prefix reuse), got %d", len(transformationCache))
+	}
+}
+
+func TestTransformationPrefixCacheUsesValueIdentity(t *testing.T) {
+	rule := NewRule()
+	_ = rule.AddTransformation("valueIdentityAppendA", transformationAppendA)
+	cache := map[transformationKey]transformationValue{}
+	key := "shared-key"
+	first := collections.Match{Variable: variables.RequestHeaders, Key: key, Value: "first"}
+	second := collections.Match{Variable: variables.RequestHeaders, Key: key, Value: "second"}
+
+	firstValue, firstErrors := rule.transformField(first, 0, cache)
+	secondValue, secondErrors := rule.transformField(second, 0, cache)
+	if firstValue != "firstA" || secondValue != "secondA" || len(firstErrors) != 0 || len(secondErrors) != 0 {
+		t.Fatalf("results = (%q, %q), errors = (%v, %v)", firstValue, secondValue, firstErrors, secondErrors)
+	}
+}
+
+func TestTransformFieldCachesSharedLargeStepAcrossDifferentPrefixes(t *testing.T) {
+	tests := []struct {
+		name            string
+		inputSize       int
+		wantSharedCalls int
+	}{
+		{name: "short input bypasses step cache", inputSize: cachedTransformationStepMinInputBytes - 1, wantSharedCalls: 2},
+		{name: "large input reuses step cache", inputSize: cachedTransformationStepMinInputBytes, wantSharedCalls: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			firstPrefixCalls := 0
+			secondPrefixCalls := 0
+			sharedCalls := 0
+			firstRule := NewRule()
+			_ = firstRule.AddTransformation("firstLargeStepPrefix", func(input string) (string, bool, error) {
+				firstPrefixCalls++
+				return input, false, nil
+			})
+			_ = firstRule.AddTransformation("sharedLargeStep", func(input string) (string, bool, error) {
+				sharedCalls++
+				return strings.ToLower(input), true, nil
+			})
+			secondRule := NewRule()
+			_ = secondRule.AddTransformation("secondLargeStepPrefix", func(input string) (string, bool, error) {
+				secondPrefixCalls++
+				return input, false, nil
+			})
+			_ = secondRule.AddTransformation("sharedLargeStep", func(input string) (string, bool, error) {
+				sharedCalls++
+				return strings.ToLower(input), true, nil
+			})
+
+			input := strings.Repeat("A", test.inputSize)
+			field := collections.Match{Variable: variables.RequestBody, Key: "REQUEST_BODY", Value: input}
+			prefixCache := map[transformationKey]transformationValue{}
+			stepCache := transformationStepCache{values: map[transformationStepKey]transformationStepValue{}}
+			first, firstErrs := firstRule.transformFieldCached(field, 0, prefixCache, &stepCache)
+			second, secondErrs := secondRule.transformFieldCached(field, 0, prefixCache, &stepCache)
+			want := strings.ToLower(input)
+			if first != want || second != want || len(firstErrs) != 0 || len(secondErrs) != 0 {
+				t.Fatalf("results = (%q, %q), errors = (%v, %v)", first, second, firstErrs, secondErrs)
+			}
+			if firstPrefixCalls != 1 || secondPrefixCalls != 1 || sharedCalls != test.wantSharedCalls {
+				t.Fatalf("transformation calls = (%d, %d, %d), want (1, 1, %d)", firstPrefixCalls, secondPrefixCalls, sharedCalls, test.wantSharedCalls)
+			}
+		})
+	}
+}
+
+func TestTransformationStepCachePreservesInputLengthIdentity(t *testing.T) {
+	calls := 0
+	transformation := ruleTransformationParams{
+		ID: transformationID(0, "inputLengthIdentity"),
+		Function: func(input string) (string, bool, error) {
+			calls++
+			return strconv.Itoa(len(input)), true, nil
+		},
+	}
+	input := strings.Repeat("x", cachedTransformationStepMinInputBytes+1)
+	cache := transformationStepCache{values: map[transformationStepKey]transformationStepValue{}}
+	short, _, _ := executeTransformationCached(transformation, input[:cachedTransformationStepMinInputBytes], &cache)
+	long, _, _ := executeTransformationCached(transformation, input, &cache)
+	if short != strconv.Itoa(cachedTransformationStepMinInputBytes) || long != strconv.Itoa(cachedTransformationStepMinInputBytes+1) {
+		t.Fatalf("cached lengths = (%q, %q)", short, long)
+	}
+	if calls != 2 {
+		t.Fatalf("transformation calls = %d, want 2", calls)
+	}
+}
+
+func TestTransformationStepCachePreservesMultiMatchChangedSemantics(t *testing.T) {
+	unchangedCalls := 0
+	unchanged := func(input string) (string, bool, error) {
+		unchangedCalls++
+		return input + "ignored", false, nil
+	}
+	normalRule := NewRule()
+	_ = normalRule.AddTransformation("sharedLargeUnchangedStep", unchanged)
+	multiMatchRule := NewRule()
+	_ = multiMatchRule.AddTransformation("sharedLargeUnchangedStep", unchanged)
+	_ = multiMatchRule.AddTransformation("appendAfterSharedLargeUnchangedStep", func(input string) (string, bool, error) {
+		return input + "B", true, nil
+	})
+
+	input := strings.Repeat("A", cachedTransformationStepMinInputBytes)
+	field := collections.Match{Variable: variables.RequestBody, Key: "REQUEST_BODY", Value: input}
+	prefixCache := map[transformationKey]transformationValue{}
+	stepCache := transformationStepCache{values: map[transformationStepKey]transformationStepValue{}}
+	normalValue, errs := normalRule.transformFieldCached(field, 0, prefixCache, &stepCache)
+	if normalValue != input+"ignored" || len(errs) != 0 {
+		t.Fatalf("normal value = %q, errors = %v", normalValue, errs)
+	}
+	multiMatchValues, errs := multiMatchRule.transformFieldMultimatchCached(field, 0, prefixCache, &stepCache, nil)
+	if !slices.Equal(multiMatchValues, []string{input, input + "B"}) || len(errs) != 0 {
+		t.Fatalf("multiMatch values = %q, errors = %v", multiMatchValues, errs)
+	}
+	if unchangedCalls != 1 {
+		t.Fatalf("shared unchanged transformation calls = %d, want 1", unchangedCalls)
+	}
+}
+
+func TestTransformationPrefixCacheKeepsErrorSlicesImmutable(t *testing.T) {
+	firstError := errors.New("first")
+	secondError := errors.New("second")
+	shortRule := NewRule()
+	_ = shortRule.AddTransformation("sharedErrorPrefix", func(string) (string, bool, error) {
+		return "", false, firstError
+	})
+	longRule := NewRule()
+	_ = longRule.AddTransformation("sharedErrorPrefix", func(string) (string, bool, error) {
+		return "", false, firstError
+	})
+	_ = longRule.AddTransformation("secondErrorStep", func(string) (string, bool, error) {
+		return "", false, secondError
+	})
+	field := collections.Match{Variable: variables.RequestURI, Key: "REQUEST_URI", Value: "input"}
+	cache := map[transformationKey]transformationValue{}
+
+	_, shortErrors := shortRule.transformField(field, 0, cache)
+	_, longErrors := longRule.transformField(field, 0, cache)
+	_, cachedShortErrors := shortRule.transformField(field, 0, cache)
+	if len(shortErrors) != 1 || len(longErrors) != 2 || len(cachedShortErrors) != 1 {
+		t.Fatalf("error counts = (%d, %d, %d), want (1, 2, 1)", len(shortErrors), len(longErrors), len(cachedShortErrors))
+	}
+}
+
+func TestTransformationStepCacheEnforcesBounds(t *testing.T) {
+	cache := transformationStepCache{values: map[transformationStepKey]transformationStepValue{}}
+	cache.retainedBytes = maxTransformationStepCacheBytes
+	cache.store(transformationStepKey{transformationID: 1}, transformationStepValue{input: "a", output: "b"})
+	if len(cache.values) != 0 {
+		t.Fatal("byte budget allowed an additional cache entry")
+	}
+
+	cache.retainedBytes = 0
+	for index := range maxTransformationStepCacheEntries + 1 {
+		cache.store(transformationStepKey{transformationID: index}, transformationStepValue{})
+	}
+	if len(cache.values) != maxTransformationStepCacheEntries {
+		t.Fatalf("cache entries = %d, want %d", len(cache.values), maxTransformationStepCacheEntries)
 	}
 }
 

@@ -3,9 +3,7 @@
 
 package transformations
 
-import (
-	"github.com/corazawaf/coraza/v3/internal/strings"
-)
+import "github.com/corazawaf/coraza/v3/internal/strings"
 
 func urlDecodeUni(data string) (string, bool, error) {
 	for i := 0; i < len(data); i++ {

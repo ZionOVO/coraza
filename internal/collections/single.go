@@ -19,6 +19,7 @@ type Single struct {
 }
 
 var _ collection.Single = &Single{}
+var _ MatchAppender = &Single{}
 
 // NewSingle creates a new Single.
 func NewSingle(variable variables.RuleVariable) *Single {
@@ -34,6 +35,11 @@ func (c *Single) FindAll() []types.MatchData {
 			Value_:    c.data,
 		},
 	}
+}
+
+// AppendMatches appends the single collection value to result.
+func (c *Single) AppendMatches(result []Match) []Match {
+	return append(result, Match{Variable: c.variable, Value: c.data})
 }
 
 func (c *Single) Get() string {

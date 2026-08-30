@@ -6,7 +6,7 @@ instances in the same process share rules.
 
 Memoization is **enabled by default** and uses a **global cache** within
 the process. In long-lived processes that reload WAF configurations,
-use `WAF.Close()` (via `experimental.WAFCloser`) to release cached
+use `experimental.WAFCloser` to call `Close` and release cached
 entries when a WAF is destroyed. Alternatively, disable memoization with
 the `coraza.no_memoize` build tag.
 

@@ -4,13 +4,45 @@
 package corazawaf
 
 import (
+	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 	"github.com/corazawaf/coraza/v3/internal/environment"
 	"github.com/corazawaf/coraza/v3/types"
 )
+
+type closeTrackingWriter struct {
+	bytes.Buffer
+	closeCalls int
+}
+
+func (w *closeTrackingWriter) Close() error {
+	w.closeCalls++
+	return nil
+}
+
+type closeTrackingAuditLogWriter struct {
+	initCalls  int
+	closeCalls int
+}
+
+func (w *closeTrackingAuditLogWriter) Init(plugintypes.AuditLogConfig) error {
+	w.initCalls++
+	return nil
+}
+
+func (*closeTrackingAuditLogWriter) Write(plugintypes.AuditLog) error {
+	return nil
+}
+
+func (w *closeTrackingAuditLogWriter) Close() error {
+	w.closeCalls++
+	return nil
+}
 
 func TestNewTransaction(t *testing.T) {
 	waf := NewWAF()
@@ -74,7 +106,7 @@ func TestSetDebugLogPath(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			w, err := resolveLogPath(test.path)
+			w, closer, err := resolveLogPath(test.path)
 			if err != nil {
 				t.Errorf("unexpected error: %s", err.Error())
 			}
@@ -82,7 +114,87 @@ func TestSetDebugLogPath(t *testing.T) {
 			if w != test.w {
 				t.Errorf("expected io.Discard, got %T", w)
 			}
+			if closer != nil {
+				t.Errorf("standard debug log target must not be owned, got %T", closer)
+			}
 		})
+	}
+}
+
+func TestSetDebugLogPathClosesOwnedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debug.log")
+	waf := NewWAF()
+	if err := waf.SetDebugLogPath(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := waf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove closed debug log: %v", err)
+	}
+}
+
+func TestReplacingDebugLogClosesOnlyOwnedOutput(t *testing.T) {
+	waf := NewWAF()
+	owned := &closeTrackingWriter{}
+	if err := waf.replaceDebugLogOutput(owned, owned); err != nil {
+		t.Fatal(err)
+	}
+	external := &closeTrackingWriter{}
+	waf.SetDebugLogOutput(external)
+	if owned.closeCalls != 1 {
+		t.Fatalf("owned output close calls: want 1, got %d", owned.closeCalls)
+	}
+	if err := waf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if external.closeCalls != 0 {
+		t.Fatalf("external output close calls: want 0, got %d", external.closeCalls)
+	}
+}
+
+func TestCloseClosesInitializedAuditLogWriterOnce(t *testing.T) {
+	waf := NewWAF()
+	writer := &closeTrackingAuditLogWriter{}
+	waf.SetAuditLogWriter(writer)
+	if got := waf.AuditLogWriter(); got != writer {
+		t.Fatalf("unexpected audit log writer %T", got)
+	}
+	if err := waf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := waf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if writer.initCalls != 1 {
+		t.Fatalf("audit log init calls: want 1, got %d", writer.initCalls)
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("audit log close calls: want 1, got %d", writer.closeCalls)
+	}
+}
+
+func TestReplacingInitializedAuditLogWriterClosesPreviousWriter(t *testing.T) {
+	waf := NewWAF()
+	first := &closeTrackingAuditLogWriter{}
+	waf.SetAuditLogWriter(first)
+	if err := waf.InitAuditLogWriter(); err != nil {
+		t.Fatal(err)
+	}
+	second := &closeTrackingAuditLogWriter{}
+	waf.SetAuditLogWriter(second)
+	if first.closeCalls != 1 {
+		t.Fatalf("previous audit log close calls: want 1, got %d", first.closeCalls)
+	}
+	if err := waf.InitAuditLogWriter(); err != nil {
+		t.Fatal(err)
+	}
+	if err := waf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if second.closeCalls != 1 {
+		t.Fatalf("replacement audit log close calls: want 1, got %d", second.closeCalls)
 	}
 }
 

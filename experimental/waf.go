@@ -27,9 +27,8 @@ type WAFWithRules interface {
 }
 
 // WAFCloser allows closing a WAF instance to release cached resources
-// such as compiled regex patterns. Transactions in-flight are unaffected
-// as they hold their own references to compiled objects.
-// This will be promoted to the public WAF interface in v4.
+// and internally opened log files. Close the WAF after all transactions
+// created from it have finished.
 type WAFCloser interface {
 	io.Closer
 }

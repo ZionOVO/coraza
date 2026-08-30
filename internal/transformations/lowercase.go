@@ -4,12 +4,70 @@
 package transformations
 
 import (
-	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
 )
 
 func lowerCase(data string) (string, bool, error) {
-	// TODO: Explicit implementation of ToLower would allow optimizing away the byte by byte comparison for returning the changed boolean
-	// See https://github.com/corazawaf/coraza/pull/778#discussion_r1186963422
-	transformedData := strings.ToLower(data)
-	return transformedData, data != transformedData, nil
+	firstChange := -1
+	for index := 0; index < len(data); {
+		current := data[index]
+		if current < utf8.RuneSelf {
+			if current >= 'A' && current <= 'Z' {
+				firstChange = index
+				break
+			}
+			index++
+			continue
+		}
+		decoded, size := utf8.DecodeRuneInString(data[index:])
+		if size == 1 || unicode.ToLower(decoded) != decoded {
+			firstChange = index
+			break
+		}
+		index += size
+	}
+	if firstChange < 0 {
+		return data, false, nil
+	}
+
+	resultCapacity := len(data)
+	if data[firstChange] >= utf8.RuneSelf {
+		_, size := utf8.DecodeRuneInString(data[firstChange:])
+		remaining := len(data) - firstChange
+		maxInt := int(^uint(0) >> 1)
+		if size == 1 {
+			switch {
+			case utf8.ValidString(data[firstChange+1:]) && len(data) <= maxInt-2:
+				resultCapacity = len(data) + 2
+			case remaining <= (maxInt-firstChange)/3:
+				resultCapacity = firstChange + 3*remaining
+			}
+		}
+	}
+
+	result := make([]byte, 0, resultCapacity)
+	result = append(result, data[:firstChange]...)
+	for index := firstChange; index < len(data); {
+		current := data[index]
+		if current < utf8.RuneSelf {
+			if current >= 'A' && current <= 'Z' {
+				current += 'a' - 'A'
+			}
+			result = append(result, current)
+			index++
+			continue
+		}
+		decoded, size := utf8.DecodeRuneInString(data[index:])
+		if size == 1 {
+			result = append(result, 0xef, 0xbf, 0xbd)
+			index++
+			continue
+		}
+		result = utf8.AppendRune(result, unicode.ToLower(decoded))
+		index += size
+	}
+	return stringsutil.WrapUnsafe(result), true, nil
 }

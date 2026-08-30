@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/corazawaf/coraza/v3/collection"
 	"github.com/corazawaf/coraza/v3/debuglog"
@@ -136,7 +137,44 @@ type Transaction struct {
 
 	variables TransactionVariables
 
-	transformationCache map[transformationKey]transformationValue
+	transformationCache     map[transformationKey]transformationValue
+	transformationStepCache transformationStepCache
+	fieldMatches            []collections.Match
+
+	bytePresenceCache [4]bytePresenceCacheEntry
+	bytePresenceNext  uint8
+}
+
+const (
+	maxRetainedFieldMatches               = 256
+	maxRetainedTransformationCacheEntries = 1024
+)
+
+type bytePresenceCacheEntry struct {
+	value   string
+	present [4]uint64
+}
+
+// LoadBytePresence returns the cached byte-presence bitmap for the exact input
+// string. The cache is transaction-local because operators in one transaction
+// repeatedly inspect the same request-body value.
+func (tx *Transaction) LoadBytePresence(value string) (*[4]uint64, bool) {
+	for index := range tx.bytePresenceCache {
+		entry := &tx.bytePresenceCache[index]
+		if len(entry.value) == len(value) && len(value) != 0 && unsafe.StringData(entry.value) == unsafe.StringData(value) {
+			return &entry.present, true
+		}
+	}
+	return nil, false
+}
+
+// StoreBytePresence caches a byte-presence bitmap for the exact input string.
+// A fixed-size ring bounds retained request data and avoids per-request maps.
+func (tx *Transaction) StoreBytePresence(value string, present [4]uint64) {
+	entry := &tx.bytePresenceCache[tx.bytePresenceNext]
+	entry.value = value
+	entry.present = present
+	tx.bytePresenceNext = (tx.bytePresenceNext + 1) % uint8(len(tx.bytePresenceCache))
 }
 
 func (tx *Transaction) ID() string {
@@ -650,25 +688,26 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 		matches = col.FindAll()
 	}
 
-	// in the most common scenario filteredMatches length will be
-	// the same as matches length, so we avoid allocating per result.
-	// We reuse the matches slice to store filtered results avoiding extra allocation.
-	filteredCount := 0
-	for _, c := range matches {
-		isException := false
-		lkey := strings.ToLower(c.Key())
-		for _, ex := range rv.Exceptions {
-			if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey || (ex.KeyStr == "" && ex.KeyRx == nil) {
-				isException = true
-				break
+	if len(rv.Exceptions) != 0 {
+		// In the most common filtered scenario matches keeps the same length, so
+		// reuse its backing array instead of allocating a second result slice.
+		filteredCount := 0
+		for _, c := range matches {
+			isException := false
+			lkey := strings.ToLower(c.Key())
+			for _, ex := range rv.Exceptions {
+				if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey || (ex.KeyStr == "" && ex.KeyRx == nil) {
+					isException = true
+					break
+				}
+			}
+			if !isException {
+				matches[filteredCount] = c
+				filteredCount++
 			}
 		}
-		if !isException {
-			matches[filteredCount] = c
-			filteredCount++
-		}
+		matches = matches[:filteredCount]
 	}
-	matches = matches[:filteredCount]
 
 	if rv.Count {
 		count := len(matches)
@@ -680,6 +719,76 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 			},
 		}
 	}
+	return matches
+}
+
+func (tx *Transaction) getFieldMatches(rv ruleVariableParams) []collections.Match {
+	matches := tx.fieldMatches[:0]
+	col := tx.Collection(rv.Variable)
+	if col == nil {
+		tx.fieldMatches = matches
+		return matches
+	}
+
+	switch {
+	case rv.KeyRx != nil:
+		if appender, ok := col.(collections.KeyedMatchAppender); ok {
+			matches = appender.AppendMatchesRegex(matches, rv.KeyRx)
+		} else if keyed, ok := col.(collection.Keyed); ok {
+			for _, match := range keyed.FindRegex(rv.KeyRx) {
+				matches = append(matches, collections.Match{Variable: match.Variable(), Key: match.Key(), Value: match.Value()})
+			}
+		} else {
+			tx.debugLogger.Error().Str("collection", rv.Variable.Name()).Msg("attempted to use regex with non-selectable collection")
+		}
+	case rv.KeyStr != "":
+		if appender, ok := col.(collections.KeyedMatchAppender); ok {
+			matches = appender.AppendMatchesString(matches, rv.KeyStr)
+		} else if keyed, ok := col.(collection.Keyed); ok {
+			for _, match := range keyed.FindString(rv.KeyStr) {
+				matches = append(matches, collections.Match{Variable: match.Variable(), Key: match.Key(), Value: match.Value()})
+			}
+		} else {
+			tx.debugLogger.Error().Str("collection", rv.Variable.Name()).Msg("attempted to use string with non-selectable collection")
+		}
+	default:
+		if appender, ok := col.(collections.MatchAppender); ok {
+			matches = appender.AppendMatches(matches)
+		} else {
+			for _, match := range col.FindAll() {
+				matches = append(matches, collections.Match{Variable: match.Variable(), Key: match.Key(), Value: match.Value()})
+			}
+		}
+	}
+
+	if len(rv.Exceptions) != 0 {
+		filteredCount := 0
+		for _, match := range matches {
+			isException := false
+			lowerKey := strings.ToLower(match.Key)
+			for _, exception := range rv.Exceptions {
+				if (exception.KeyRx != nil && exception.KeyRx.MatchString(lowerKey)) || strings.ToLower(exception.KeyStr) == lowerKey || (exception.KeyStr == "" && exception.KeyRx == nil) {
+					isException = true
+					break
+				}
+			}
+			if !isException {
+				matches[filteredCount] = match
+				filteredCount++
+			}
+		}
+		matches = matches[:filteredCount]
+	}
+
+	if rv.Count {
+		count := len(matches)
+		matches = append(matches[:0], collections.Match{
+			Variable: rv.Variable,
+			Key:      rv.KeyStr,
+			Value:    strconv.Itoa(count),
+		})
+	}
+	tx.fieldMatches = matches
 	return matches
 }
 
@@ -1687,6 +1796,17 @@ func (tx *Transaction) Close() error {
 	}
 
 	tx.variables.reset()
+	tx.resetTransformationCaches()
+	if cap(tx.fieldMatches) > maxRetainedFieldMatches {
+		tx.fieldMatches = nil
+	} else {
+		clear(tx.fieldMatches[:cap(tx.fieldMatches)])
+		tx.fieldMatches = tx.fieldMatches[:0]
+	}
+	for index := range tx.bytePresenceCache {
+		tx.bytePresenceCache[index] = bytePresenceCacheEntry{}
+	}
+	tx.bytePresenceNext = 0
 	if err := tx.requestBodyBuffer.Reset(); err != nil {
 		errs = append(errs, fmt.Errorf("reseting request body buffer: %v", err))
 	}
@@ -1711,6 +1831,20 @@ func (tx *Transaction) Close() error {
 	}
 
 	return fmt.Errorf("transaction close failed: %v", errors.Join(errs...))
+}
+
+func (tx *Transaction) resetTransformationCaches() {
+	if len(tx.transformationCache) > maxRetainedTransformationCacheEntries {
+		tx.transformationCache = map[transformationKey]transformationValue{}
+	} else {
+		clear(tx.transformationCache)
+	}
+	if len(tx.transformationStepCache.values) > maxRetainedTransformationCacheEntries {
+		tx.transformationStepCache.values = map[transformationStepKey]transformationStepValue{}
+	} else {
+		clear(tx.transformationStepCache.values)
+	}
+	tx.transformationStepCache.retainedBytes = 0
 }
 
 // String will return a string with the transaction debug information

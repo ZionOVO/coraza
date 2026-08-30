@@ -45,7 +45,8 @@ func newPMFromDataset(options plugintypes.OperatorOptions) (plugintypes.Operator
 		DFA:                  true,
 	})
 
-	m, _ := memoizeDo(options.Memoizer, data, func() (any, error) { return builder.Build(dataset), nil })
+	cacheKey := pmMemoizeKey("pm-from-dataset", "ascii-case-insensitive:leftmost-longest:dfa", dataset)
+	m, _ := memoizeDo(options.Memoizer, cacheKey, func() (any, error) { return builder.Build(dataset), nil })
 
 	return &pm{matcher: m.(ahocorasick.AhoCorasick), minLen: minPatternLen(dataset)}, nil
 }

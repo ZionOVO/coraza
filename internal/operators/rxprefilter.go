@@ -32,10 +32,10 @@
 //   - "definitely no match" → skip regex (correct: required literals absent)
 //   - "maybe match" → run regex (conservative: may still not match)
 //
-// A bug in literal extraction can only make the prefilter say "maybe" too
-// often (degraded performance), never cause a false negative (missed attack).
-// This is safe by construction — the prefilter is a necessary-condition check,
-// not a sufficient-condition check.
+// Every extracted constraint must be a true necessary condition. Violating
+// that invariant can make the prefilter reject an input that the regular
+// expression accepts, so differential and fuzz tests compare every optimized
+// decision with the reference regular expression engine.
 //
 // Design principle: when in doubt, fall back to the regex. The prefilter is
 // purely an optimization. If there is any uncertainty about whether the input
@@ -72,6 +72,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
 // minMatchLength computes the minimum number of bytes an input must have
@@ -151,10 +153,77 @@ func minLen(re *syntax.Regexp) int {
 	}
 }
 
-// prefilterFunc returns a function that returns true if the regex might match
-// the input, false if it definitely cannot. Returns nil when no useful
-// prefilter can be built.
+type compiledPrefilter struct {
+	match          func(string) bool
+	matchWithState func(plugintypes.TransactionState, string) bool
+}
+
+// prefilterFunc returns a stateless necessary-condition check for a regular
+// expression. Callers with transaction state should use compilePrefilter.
 func prefilterFunc(pattern string) func(string) bool {
+	return compilePrefilter(pattern).match
+}
+
+func compilePrefilter(pattern string) compiledPrefilter {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return compiledPrefilter{}
+	}
+	re = re.Simplify()
+	caseInsensitive := hasFlag(re, syntax.FoldCase)
+	literals := extractLiterals(re, caseInsensitive)
+	if caseInsensitive && literals != nil && !extractedLiteralsAreASCII(literals) {
+		return compiledPrefilter{}
+	}
+
+	match := buildPrefilterFunc(pattern)
+	if match == nil || literals == nil {
+		return compiledPrefilter{match: match}
+	}
+
+	var needles []string
+	switch values := literals.(type) {
+	case allRequired:
+		if literal := longest(values); literal != "" {
+			needles = []string{literal}
+		}
+	case anyRequired:
+		needles = values
+	case combinedRequired:
+		if literal := longest(values.all); literal != "" {
+			needles = []string{literal}
+		} else {
+			needles = values.any
+		}
+	}
+	if len(needles) == 0 {
+		return compiledPrefilter{match: match}
+	}
+	required := newRequiredByteMatcher(needles, caseInsensitive)
+	return compiledPrefilter{
+		match: match,
+		matchWithState: func(tx plugintypes.TransactionState, value string) bool {
+			return required.matchWithState(tx, value) && match(value)
+		},
+	}
+}
+
+func extractedLiteralsAreASCII(literals any) bool {
+	switch values := literals.(type) {
+	case allRequired:
+		return allASCIIStrings(values)
+	case anyRequired:
+		return allASCIIStrings(values)
+	case combinedRequired:
+		return allASCIIStrings(values.all) && allASCIIStrings(values.any)
+	default:
+		return false
+	}
+}
+
+// buildPrefilterFunc returns a function that returns true if the regex might
+// match the input, false if it definitely cannot.
+func buildPrefilterFunc(pattern string) func(string) bool {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil
@@ -218,8 +287,8 @@ func prefilterFunc(pattern string) func(string) bool {
 		// A literal is the prefix/suffix constraint only when it survived
 		// filterShort (len >= 2), meaning it IS the first/last literal in the
 		// pattern and not replaced by a longer one that appeared elsewhere.
-		usePrefix := hasBeginAnchor(re) && len(origFirst) >= 2
-		useSuffix := hasEndAnchor(re) && len(origLast) >= 2
+		usePrefix := hasAnchoredLiteralPrefix(re, origFirst, caseInsensitive)
+		useSuffix := hasAnchoredLiteralSuffix(re, origLast, caseInsensitive)
 		if !usePrefix && !useSuffix {
 			// No anchor: sort longest-first for best early exit.
 			slices.SortFunc(filtered, func(a, b string) int { return len(b) - len(a) })
@@ -742,6 +811,170 @@ func filterShort(ss []string, minLen int) []string {
 // Raise if profiling shows Wu-Manber still wins beyond that.
 const anyRequiredMaxN = 256
 
+// requiredByteMatcher checks a necessary byte set before an indexed search.
+// The selected set intersects every candidate literal, so absence proves that
+// none of the literals can match while presence remains only a maybe-match.
+type requiredByteMatcher struct {
+	bytes      [256]bool
+	bits       [4]uint64
+	characters string
+	ascii      bool
+}
+
+type bytePresenceCache interface {
+	LoadBytePresence(string) (*[4]uint64, bool)
+	StoreBytePresence(string, [4]uint64)
+}
+
+const cachedBytePresenceMinInputBytes = 512
+
+func newRequiredByteMatcher(needles []string, caseFold bool) *requiredByteMatcher {
+	groups := make([][]byte, 0, len(needles))
+	for _, needle := range needles {
+		var present [256]bool
+		group := make([]byte, 0, len(needle))
+		for index := range len(needle) {
+			value := needle[index]
+			if !present[value] {
+				present[value] = true
+				group = append(group, value)
+			}
+		}
+		groups = append(groups, group)
+	}
+
+	matcher := &requiredByteMatcher{}
+	covered := make([]bool, len(groups))
+	remaining := len(groups)
+	for remaining > 0 {
+		var counts [256]int
+		for index, group := range groups {
+			if covered[index] {
+				continue
+			}
+			for _, value := range group {
+				counts[value]++
+			}
+		}
+		best := byte(0)
+		for value := 1; value < len(counts); value++ {
+			if counts[value] > counts[best] || counts[value] == counts[best] && byteRarity(byte(value)) > byteRarity(best) {
+				best = byte(value)
+			}
+		}
+		matcher.add(best, caseFold)
+		for index, group := range groups {
+			if covered[index] || !containsByte(group, best) {
+				continue
+			}
+			covered[index] = true
+			remaining--
+		}
+	}
+	var characters strings.Builder
+	matcher.ascii = true
+	for value, selected := range matcher.bytes {
+		if !selected {
+			continue
+		}
+		if value >= utf8.RuneSelf {
+			matcher.ascii = false
+			break
+		}
+		characters.WriteByte(byte(value))
+	}
+	if matcher.ascii {
+		matcher.characters = characters.String()
+	}
+	return matcher
+}
+
+func byteRarity(value byte) int {
+	switch value {
+	case 'e', 't', 'a', 'o', 'i', 'n', 's', 'h', 'r':
+		return 0
+	case 'd', 'l', 'u', 'c', 'm', 'f', 'y', 'w', 'g', 'p', 'b', 'v':
+		return 1
+	case 'k', 'j', 'q', 'x', 'z':
+		return 2
+	default:
+		return 3
+	}
+}
+
+func (matcher *requiredByteMatcher) match(value string) bool {
+	if matcher.ascii {
+		return strings.ContainsAny(value, matcher.characters)
+	}
+	for index := range len(value) {
+		if matcher.bytes[value[index]] {
+			return true
+		}
+	}
+	return false
+}
+
+func (matcher *requiredByteMatcher) matchWithState(tx plugintypes.TransactionState, value string) bool {
+	cache, ok := tx.(bytePresenceCache)
+	if !ok || len(value) < cachedBytePresenceMinInputBytes {
+		return matcher.match(value)
+	}
+	if present, found := cache.LoadBytePresence(value); found {
+		for index := range matcher.bits {
+			if present[index]&matcher.bits[index] != 0 {
+				return true
+			}
+		}
+		return false
+	}
+	if matcher.match(value) {
+		return true
+	}
+	var present [4]uint64
+	for index := range len(value) {
+		current := value[index]
+		present[current>>6] |= uint64(1) << (current & 63)
+	}
+	cache.StoreBytePresence(value, present)
+	return false
+}
+
+func (matcher *requiredByteMatcher) possibleFromCache(tx plugintypes.TransactionState, value string) bool {
+	cache, ok := tx.(bytePresenceCache)
+	if !ok || len(value) < cachedBytePresenceMinInputBytes {
+		return true
+	}
+	present, found := cache.LoadBytePresence(value)
+	if !found {
+		return true
+	}
+	for index := range matcher.bits {
+		if present[index]&matcher.bits[index] != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (matcher *requiredByteMatcher) add(value byte, caseFold bool) {
+	matcher.bytes[value] = true
+	matcher.bits[value>>6] |= uint64(1) << (value & 63)
+	if caseFold && value >= 'a' && value <= 'z' {
+		upper := value - ('a' - 'A')
+		matcher.bytes[upper] = true
+		matcher.bits[upper>>6] |= uint64(1) << (upper & 63)
+	}
+}
+
+func containsByte(values []byte, target byte) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 // indexedMatcher performs sub-linear multi-pattern substring matching using a
 // Wu-Manber style shift table. Instead of examining every byte in the haystack,
 // it slides a window of size minLen and looks at the byte at the window's right
@@ -763,6 +996,7 @@ type indexedMatcher struct {
 	endBuckets [256][]string // needles grouped by their byte at position minLen-1
 	minLen     int
 	ci         bool
+	required   *requiredByteMatcher
 }
 
 func newIndexedMatcher(needles []string, ci bool) *indexedMatcher {
@@ -794,6 +1028,7 @@ func newIndexedMatcher(needles []string, ci bool) *indexedMatcher {
 			norms[i] = strings.ToLower(n)
 		}
 	}
+	im.required = newRequiredByteMatcher(norms, ci)
 
 	for _, n := range norms {
 		for j := 0; j < im.minLen; j++ {
@@ -824,6 +1059,13 @@ func (m *indexedMatcher) match(s string) bool {
 		return m.matchCI(s)
 	}
 	return m.matchCS(s)
+}
+
+func (m *indexedMatcher) matchWithState(tx plugintypes.TransactionState, value string) bool {
+	if m.required != nil && !m.required.possibleFromCache(tx, value) {
+		return false
+	}
+	return m.match(value)
 }
 
 func (m *indexedMatcher) matchCS(s string) bool {
@@ -984,39 +1226,39 @@ func containsFoldASCIIOnly(s, needle string) bool {
 // Anchor helpers (Gap 1)
 // ---------------------------------------------------------------------------
 
-// hasBeginAnchor reports whether re requires the match to start at position 0
-// of the input. Only OpBeginText (\A) is accepted — OpBeginLine (^ with (?m))
-// can match after any newline and is NOT a position-0 guarantee, so using
-// strings.HasPrefix for it would produce false negatives on multi-line inputs.
-func hasBeginAnchor(re *syntax.Regexp) bool {
-	switch re.Op {
-	case syntax.OpBeginText:
-		return true
-	case syntax.OpCapture:
-		return hasBeginAnchor(re.Sub[0])
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return hasBeginAnchor(re.Sub[0])
-		}
+// hasAnchoredLiteralPrefix reports whether literal is the first consuming
+// expression immediately after an absolute beginning anchor. Merely having an
+// anchor somewhere before the first extracted literal is insufficient: for
+// example, `^.00` is anchored but "00" starts at byte one, not byte zero.
+func hasAnchoredLiteralPrefix(re *syntax.Regexp, literal string, ci bool) bool {
+	for re.Op == syntax.OpCapture {
+		re = re.Sub[0]
 	}
-	return false
+	if literal == "" || re.Op != syntax.OpConcat || len(re.Sub) < 2 || re.Sub[0].Op != syntax.OpBeginText {
+		return false
+	}
+	return immediateLiteral(re.Sub[1], ci) == literal
 }
 
-// hasEndAnchor reports whether re requires the match to end at the very last
-// byte of the input. Only OpEndText (\z) is accepted for the same reason as
-// hasBeginAnchor — OpEndLine ($ with (?m)) can match before any newline.
-func hasEndAnchor(re *syntax.Regexp) bool {
-	switch re.Op {
-	case syntax.OpEndText:
-		return true
-	case syntax.OpCapture:
-		return hasEndAnchor(re.Sub[0])
-	case syntax.OpConcat:
-		if len(re.Sub) > 0 {
-			return hasEndAnchor(re.Sub[len(re.Sub)-1])
-		}
+// hasAnchoredLiteralSuffix reports whether literal is the last consuming
+// expression immediately before an absolute ending anchor. A wildcard or
+// another consuming expression between them makes a suffix check unsound.
+func hasAnchoredLiteralSuffix(re *syntax.Regexp, literal string, ci bool) bool {
+	for re.Op == syntax.OpCapture {
+		re = re.Sub[0]
 	}
-	return false
+	last := len(re.Sub) - 1
+	if literal == "" || re.Op != syntax.OpConcat || last < 1 || re.Sub[last].Op != syntax.OpEndText {
+		return false
+	}
+	return immediateLiteral(re.Sub[last-1], ci) == literal
+}
+
+func immediateLiteral(re *syntax.Regexp, ci bool) string {
+	for re.Op == syntax.OpCapture {
+		re = re.Sub[0]
+	}
+	return rawLiteral(re, ci)
 }
 
 // hasPrefixFoldASCII reports whether s begins with prefix (ASCII case-insensitive).
@@ -1124,8 +1366,8 @@ func buildCombinedPF(v combinedRequired, ci bool, re *syntax.Regexp) func(string
 
 	var allPF func(string) bool
 	if len(filteredAll) > 0 {
-		usePrefix := hasBeginAnchor(re) && len(origFirst) >= 2
-		useSuffix := hasEndAnchor(re) && len(origLast) >= 2
+		usePrefix := hasAnchoredLiteralPrefix(re, origFirst, ci)
+		useSuffix := hasAnchoredLiteralSuffix(re, origLast, ci)
 		if !usePrefix && !useSuffix {
 			slices.SortFunc(filteredAll, func(a, b string) int { return len(b) - len(a) })
 		}

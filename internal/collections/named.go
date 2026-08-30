@@ -100,6 +100,8 @@ type NamedCollectionNames struct {
 	collection *NamedCollection
 }
 
+var _ KeyedMatchAppender = &NamedCollectionNames{}
+
 func (c *NamedCollectionNames) FindRegex(key *regexp.Regexp) []types.MatchData {
 	n := 0
 	// Collect matching data slices in a single pass to avoid evaluating the regex twice per key.
@@ -175,6 +177,37 @@ func (c *NamedCollectionNames) FindAll() []types.MatchData {
 		}
 	}
 	return res
+}
+
+// AppendMatches appends every collection name to result.
+func (c *NamedCollectionNames) AppendMatches(result []Match) []Match {
+	for _, data := range c.collection.data {
+		for _, value := range data {
+			result = append(result, Match{Variable: c.variable, Key: value.key, Value: value.key})
+		}
+	}
+	return result
+}
+
+// AppendMatchesRegex appends collection names whose key matches key.
+func (c *NamedCollectionNames) AppendMatchesRegex(result []Match, key *regexp.Regexp) []Match {
+	for current, data := range c.collection.data {
+		if !key.MatchString(current) {
+			continue
+		}
+		for _, value := range data {
+			result = append(result, Match{Variable: c.variable, Key: value.key, Value: value.key})
+		}
+	}
+	return result
+}
+
+// AppendMatchesString appends collection names selected by key.
+func (c *NamedCollectionNames) AppendMatchesString(result []Match, key string) []Match {
+	for _, value := range c.collection.data[key] {
+		result = append(result, Match{Variable: c.variable, Key: value.key, Value: value.key})
+	}
+	return result
 }
 
 func (c *NamedCollectionNames) Name() string {

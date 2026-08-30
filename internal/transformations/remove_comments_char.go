@@ -3,9 +3,16 @@
 
 package transformations
 
-import stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
+import (
+	"strings"
+
+	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
+)
 
 func removeCommentsChar(value string) (string, bool, error) {
+	if !strings.ContainsAny(value, "/*<-#") {
+		return value, false, nil
+	}
 	inputLen := len(value)
 	res := make([]byte, 0, inputLen)
 	changed := false
