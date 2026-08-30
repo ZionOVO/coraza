@@ -78,6 +78,8 @@ type ruleVariableParams struct {
 type ruleTransformationParams struct {
 	// The transformation function to be used
 	Function plugintypes.Transformation
+	// ID identifies the registered transformation independently of its chain position.
+	ID int
 }
 
 // Rule is used to test a Transaction against certain operators
@@ -264,10 +266,18 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 			var argsLen int
 			for i, arg := range values {
 				if r.MultiMatch {
-					args, errs = r.transformMultiMatchField(arg)
+					if len(arg.Value) < cachedTransformationStepMinInputBytes || arg.Variable.Name() == "TX" {
+						args, errs = r.executeTransformationsMultimatchInto(args[:0], arg.Value)
+					} else {
+						args, errs = r.transformFieldMultimatchCached(arg, i, cache, &tx.transformationStepCache, args[:0])
+					}
 					argsLen = len(args)
 				} else {
-					args[0], errs = r.transformField(arg, i, cache)
+					if len(arg.Value) < cachedTransformationStepMinInputBytes {
+						args[0], errs = r.transformField(arg, i, cache)
+					} else {
+						args[0], errs = r.transformFieldCached(arg, i, cache, &tx.transformationStepCache)
+					}
 					argsLen = 1
 				}
 				if len(errs) > 0 {
@@ -415,18 +425,10 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 }
 
 func (r *Rule) transformMultiMatchArg(arg types.MatchData) ([]string, []error) {
-	return r.transformMultiMatchField(collections.Match{
-		Variable: arg.Variable(),
-		Key:      arg.Key(),
-		Value:    arg.Value(),
-	})
-}
-
-func (r *Rule) transformMultiMatchField(arg collections.Match) ([]string, []error) {
 	// TODOs:
 	// - We don't need to run every transformation. We could try for each until found
 	// - Cache is not used for multimatch
-	return r.executeTransformationsMultimatch(arg.Value)
+	return r.executeTransformationsMultimatch(arg.Value())
 }
 
 func (r *Rule) transformArg(arg types.MatchData, argIdx int, cache map[transformationKey]transformationValue) (string, []error) {
@@ -437,7 +439,48 @@ func (r *Rule) transformArg(arg types.MatchData, argIdx int, cache map[transform
 	}, argIdx, cache)
 }
 
-func (r *Rule) transformField(arg collections.Match, argIdx int, cache map[transformationKey]transformationValue) (string, []error) {
+func (r *Rule) transformField(arg collections.Match, _ int, cache map[transformationKey]transformationValue) (string, []error) {
+	switch {
+	case len(r.transformations) == 0:
+		return arg.Value, nil
+	case arg.Variable.Name() == "TX":
+		return r.executeTransformations(arg.Value)
+	default:
+		startIdx := 0
+		value := arg.Value
+		var errs []error
+
+		for index := len(r.transformationPrefixIDs) - 1; index >= 0; index-- {
+			key := newTransformationKey(arg, r.transformationPrefixIDs[index], false)
+			if cached, ok := cache[key]; ok {
+				if index == len(r.transformationPrefixIDs)-1 {
+					return cached.arg, cached.errs
+				}
+				value = cached.arg
+				errs = cached.errs
+				startIdx = index + 1
+				break
+			}
+		}
+
+		for index := startIdx; index < len(r.transformations); index++ {
+			valueAfterTransformation, _, err := r.transformations[index].Function(value)
+			if err != nil {
+				errs = appendTransformationError(errs, err)
+			} else {
+				value = valueAfterTransformation
+			}
+			key := newTransformationKey(arg, r.transformationPrefixIDs[index], false)
+			cache[key] = transformationValue{input: arg.Value, arg: value, errs: errs}
+		}
+		return value, errs
+	}
+}
+
+func (r *Rule) transformFieldCached(arg collections.Match, _ int, cache map[transformationKey]transformationValue, stepCache *transformationStepCache) (string, []error) {
+	if stepCache == nil || len(arg.Value) < cachedTransformationStepMinInputBytes {
+		return r.transformField(arg, 0, cache)
+	}
 	switch {
 	case len(r.transformations) == 0:
 		return arg.Value, nil
@@ -446,10 +489,6 @@ func (r *Rule) transformField(arg collections.Match, argIdx int, cache map[trans
 		arg, errs := r.executeTransformations(arg.Value)
 		return arg, errs
 	default:
-		// NOTE: See comment on transformationKey struct to understand this hacky code
-		argKey := arg.Key
-		argKeyPtr := unsafe.StringData(argKey)
-
 		// Search from longest prefix (full chain) backwards for a cache hit.
 		// Best case: full chain cached → single map lookup, done.
 		// Typical case: shared prefix cached → start computing from there.
@@ -458,12 +497,7 @@ func (r *Rule) transformField(arg collections.Match, argIdx int, cache map[trans
 		var errs []error
 
 		for i := len(r.transformationPrefixIDs) - 1; i >= 0; i-- {
-			key := transformationKey{
-				argKey:            argKeyPtr,
-				argIndex:          argIdx,
-				argVariable:       arg.Variable,
-				transformationsID: r.transformationPrefixIDs[i],
-			}
+			key := newTransformationKey(arg, r.transformationPrefixIDs[i], false)
 			if cached, ok := cache[key]; ok {
 				if i == len(r.transformationPrefixIDs)-1 {
 					// Full chain cached — nothing more to compute
@@ -479,20 +513,23 @@ func (r *Rule) transformField(arg collections.Match, argIdx int, cache map[trans
 		// Execute remaining transformations, caching each intermediate step
 		// so later rules sharing a prefix can reuse our work.
 		for i := startIdx; i < len(r.transformations); i++ {
-			v, _, err := r.transformations[i].Function(value)
+			transformation := r.transformations[i]
+			var v string
+			var changed bool
+			var err error
+			if stepCache != nil && len(value) >= cachedTransformationStepMinInputBytes {
+				v, changed, err = executeTransformationCached(transformation, value, stepCache)
+			} else {
+				v, changed, err = transformation.Function(value)
+			}
 			if err != nil {
-				errs = append(errs, err)
+				errs = appendTransformationError(errs, err)
 			} else {
 				value = v
 			}
 
-			key := transformationKey{
-				argKey:            argKeyPtr,
-				argIndex:          argIdx,
-				argVariable:       arg.Variable,
-				transformationsID: r.transformationPrefixIDs[i],
-			}
-			cache[key] = transformationValue{arg: value, errs: errs}
+			key := newTransformationKey(arg, r.transformationPrefixIDs[i], false)
+			cache[key] = transformationValue{input: arg.Value, arg: value, errs: errs, changed: changed && err == nil}
 		}
 
 		return value, errs
@@ -703,7 +740,10 @@ func (r *Rule) AddTransformation(name string, t plugintypes.Transformation) erro
 	if t == nil || name == "" {
 		return fmt.Errorf("invalid transformation %q not found", name)
 	}
-	r.transformations = append(r.transformations, ruleTransformationParams{Function: t})
+	r.transformations = append(r.transformations, ruleTransformationParams{
+		Function: t,
+		ID:       transformationID(0, name),
+	})
 	r.transformationsID = transformationID(r.transformationsID, name)
 	r.transformationPrefixIDs = append(r.transformationPrefixIDs, r.transformationsID)
 	return nil
@@ -738,22 +778,87 @@ func (r *Rule) executeOperator(data string, tx *Transaction) (result bool) {
 }
 
 func (r *Rule) executeTransformationsMultimatch(value string) ([]string, []error) {
-	// The original value will be evaluated
-	res := []string{value}
+	return r.executeTransformationsMultimatchInto(nil, value)
+}
+
+func (r *Rule) executeTransformationsMultimatchInto(result []string, value string) ([]string, []error) {
+	result = append(result, value)
 	var errs []error
 	for _, t := range r.transformations {
 		transformedValue, changed, err := t.Function(value)
 		if err != nil {
-			errs = append(errs, err)
+			errs = appendTransformationError(errs, err)
 			continue
 		}
 		// Every time a transformation generates a new value different from the previous one, the new value is collected to be evaluated
 		if changed {
-			res = append(res, transformedValue)
+			result = append(result, transformedValue)
 			value = transformedValue
 		}
 	}
-	return res, errs
+	return result, errs
+}
+
+func (r *Rule) transformFieldMultimatch(arg collections.Match, _ int, cache map[transformationKey]transformationValue, result []string) ([]string, []error) {
+	return r.transformFieldMultimatchCached(arg, 0, cache, nil, result)
+}
+
+func (r *Rule) transformFieldMultimatchCached(arg collections.Match, _ int, cache map[transformationKey]transformationValue, stepCache *transformationStepCache, result []string) ([]string, []error) {
+	if len(r.transformations) == 0 || len(arg.Value) < cachedTransformationStepMinInputBytes || arg.Variable.Name() == "TX" {
+		return r.executeTransformationsMultimatchInto(result, arg.Value)
+	}
+
+	result = append(result, arg.Value)
+	value := arg.Value
+	var errs []error
+	startIdx := 0
+
+	for index, transformationsID := range r.transformationPrefixIDs {
+		key := newTransformationKey(arg, transformationsID, true)
+		cached, ok := cache[key]
+		if !ok {
+			break
+		}
+		value = cached.arg
+		errs = cached.errs
+		if cached.changed {
+			result = append(result, value)
+		}
+		startIdx = index + 1
+	}
+
+	for index := startIdx; index < len(r.transformations); index++ {
+		transformation := r.transformations[index]
+		var transformedValue string
+		var changed bool
+		var err error
+		if stepCache != nil && len(value) >= cachedTransformationStepMinInputBytes {
+			transformedValue, changed, err = executeTransformationCached(transformation, value, stepCache)
+		} else {
+			transformedValue, changed, err = transformation.Function(value)
+		}
+		if err != nil {
+			errs = appendTransformationError(errs, err)
+			changed = false
+		} else if changed {
+			value = transformedValue
+			result = append(result, value)
+		}
+
+		key := newTransformationKey(arg, r.transformationPrefixIDs[index], true)
+		cache[key] = transformationValue{input: arg.Value, arg: value, errs: errs, changed: changed}
+	}
+	return result, errs
+}
+
+func newTransformationKey(arg collections.Match, transformationsID int, multiMatch bool) transformationKey {
+	return transformationKey{
+		input:             unsafe.StringData(arg.Value),
+		inputLength:       len(arg.Value),
+		argVariable:       arg.Variable,
+		transformationsID: transformationsID,
+		multiMatch:        multiMatch,
+	}
 }
 
 func (r *Rule) executeTransformations(value string) (string, []error) {
@@ -761,12 +866,37 @@ func (r *Rule) executeTransformations(value string) (string, []error) {
 	for _, t := range r.transformations {
 		v, _, err := t.Function(value)
 		if err != nil {
-			errs = append(errs, err)
+			errs = appendTransformationError(errs, err)
 			continue
 		}
 		value = v
 	}
 	return value, errs
+}
+
+func appendTransformationError(errs []error, err error) []error {
+	return append(errs[:len(errs):len(errs)], err)
+}
+
+const cachedTransformationStepMinInputBytes = 512
+
+func executeTransformationCached(transformation ruleTransformationParams, input string, cache *transformationStepCache) (string, bool, error) {
+	key := transformationStepKey{
+		input:            unsafe.StringData(input),
+		inputLength:      len(input),
+		transformationID: transformation.ID,
+	}
+	if cached, ok := cache.values[key]; ok {
+		return cached.output, cached.changed, cached.err
+	}
+	output, changed, err := transformation.Function(input)
+	cache.store(key, transformationStepValue{
+		input:   input,
+		output:  output,
+		changed: changed,
+		err:     err,
+	})
+	return output, changed, err
 }
 
 // SetMemoizer sets the memoizer used for caching compiled regexes in variable selectors.

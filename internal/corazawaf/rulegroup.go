@@ -160,10 +160,8 @@ func (rg *RuleGroup) Eval(phase types.RulePhase, tx *Transaction) bool {
 	tx.lastPhase = phase
 	usedRules := 0
 	ts := time.Now().UnixNano()
+	tx.resetTransformationCaches()
 	transformationCache := tx.transformationCache
-	for k := range transformationCache {
-		delete(transformationCache, k)
-	}
 RulesLoop:
 	for i := range rg.rules {
 		r := &rg.rules[i]
@@ -288,20 +286,60 @@ func NewRuleGroup() RuleGroup {
 }
 
 type transformationKey struct {
-	// TODO(anuraaga): This is a big hack to support performance on TinyGo. TinyGo
-	// cannot efficiently compute a hashcode for a struct if it has embedded non-fixed
-	// size fields, for example string as we'd prefer to use here. A pointer is usable,
-	// and it works for us since we know that the arg key string is populated once per
-	// transaction phase and we would never have different string pointers with the same
-	// content, or more problematically same pointer for different content, as the strings
-	// will be alive throughout the phase.
-	argKey            *byte
-	argIndex          int
+	input             *byte
+	inputLength       int
 	argVariable       variables.RuleVariable
 	transformationsID int
+	multiMatch        bool
 }
 
 type transformationValue struct {
-	arg  string
-	errs []error
+	// input keeps the memory addressed by transformationKey.input alive.
+	input   string
+	arg     string
+	errs    []error
+	changed bool
+}
+
+type transformationStepKey struct {
+	// The cached value retains input so this pointer cannot be reused for other contents.
+	input            *byte
+	inputLength      int
+	transformationID int
+}
+
+type transformationStepValue struct {
+	// input keeps the memory addressed by transformationStepKey.input alive.
+	input   string
+	output  string
+	changed bool
+	err     error
+}
+
+type transformationStepCache struct {
+	values        map[transformationStepKey]transformationStepValue
+	retainedBytes int
+}
+
+const (
+	maxTransformationStepCacheEntries = 512
+	maxTransformationStepCacheBytes   = 16 << 20
+)
+
+func (cache *transformationStepCache) store(key transformationStepKey, value transformationStepValue) {
+	if len(cache.values) >= maxTransformationStepCacheEntries {
+		return
+	}
+	if len(value.input) > maxTransformationStepCacheBytes || len(value.output) > maxTransformationStepCacheBytes-len(value.input) {
+		return
+	}
+	retainedBytes := len(value.input) + len(value.output)
+	if retainedBytes > maxTransformationStepCacheBytes-cache.retainedBytes {
+		return
+	}
+	if cache.values == nil {
+		cache.values = make(map[transformationStepKey]transformationStepValue)
+	}
+	cache.values[key] = value
+	cache.retainedBytes += retainedBytes
 }

@@ -137,14 +137,18 @@ type Transaction struct {
 
 	variables TransactionVariables
 
-	transformationCache map[transformationKey]transformationValue
-	fieldMatches        []collections.Match
+	transformationCache     map[transformationKey]transformationValue
+	transformationStepCache transformationStepCache
+	fieldMatches            []collections.Match
 
 	bytePresenceCache [4]bytePresenceCacheEntry
 	bytePresenceNext  uint8
 }
 
-const maxRetainedFieldMatches = 256
+const (
+	maxRetainedFieldMatches               = 256
+	maxRetainedTransformationCacheEntries = 1024
+)
 
 type bytePresenceCacheEntry struct {
 	value   string
@@ -1792,6 +1796,7 @@ func (tx *Transaction) Close() error {
 	}
 
 	tx.variables.reset()
+	tx.resetTransformationCaches()
 	if cap(tx.fieldMatches) > maxRetainedFieldMatches {
 		tx.fieldMatches = nil
 	} else {
@@ -1826,6 +1831,20 @@ func (tx *Transaction) Close() error {
 	}
 
 	return fmt.Errorf("transaction close failed: %v", errors.Join(errs...))
+}
+
+func (tx *Transaction) resetTransformationCaches() {
+	if len(tx.transformationCache) > maxRetainedTransformationCacheEntries {
+		tx.transformationCache = map[transformationKey]transformationValue{}
+	} else {
+		clear(tx.transformationCache)
+	}
+	if len(tx.transformationStepCache.values) > maxRetainedTransformationCacheEntries {
+		tx.transformationStepCache.values = map[transformationStepKey]transformationStepValue{}
+	} else {
+		clear(tx.transformationStepCache.values)
+	}
+	tx.transformationStepCache.retainedBytes = 0
 }
 
 // String will return a string with the transaction debug information

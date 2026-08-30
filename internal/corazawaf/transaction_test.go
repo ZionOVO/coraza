@@ -1194,7 +1194,7 @@ func TestRelevantAuditLoggingWithoutAuditFlag(t *testing.T) {
 // Transaction: when it does, make sure the field is reset on pool reuse, then
 // update wantFields.
 func TestTransactionFieldCount(t *testing.T) {
-	const wantFields = 38
+	const wantFields = 39
 	if got := reflect.TypeFor[Transaction]().NumField(); got != wantFields {
 		t.Fatalf("Transaction has %d fields, want %d. If you added a field, make sure it "+
 			"is reset on pool reuse in newTransaction() (or Close()), then update wantFields.", got, wantFields)
@@ -1812,8 +1812,13 @@ func TestTxGetFieldMatchesPreservesGetFieldSemantics(t *testing.T) {
 	}
 }
 
-func TestTransactionCloseDropsOversizedFieldMatchBuffer(t *testing.T) {
+func TestTransactionCloseDropsRequestDataCaches(t *testing.T) {
 	tx := NewWAF().NewTransaction()
+	for index := range maxRetainedTransformationCacheEntries + 1 {
+		tx.transformationCache[transformationKey{transformationsID: index}] = transformationValue{arg: "retained request value"}
+		tx.transformationStepCache.values[transformationStepKey{transformationID: index}] = transformationStepValue{input: "retained step input", output: "retained step output"}
+	}
+	tx.transformationStepCache.retainedBytes = maxTransformationStepCacheBytes
 	for index := range maxRetainedFieldMatches + 1 {
 		tx.AddGetRequestArgument(strconv.Itoa(index), "value")
 	}
@@ -1826,6 +1831,12 @@ func TestTransactionCloseDropsOversizedFieldMatchBuffer(t *testing.T) {
 	}
 	if tx.fieldMatches != nil {
 		t.Fatalf("oversized field match buffer retained with capacity %d", cap(tx.fieldMatches))
+	}
+	if len(tx.transformationCache) != 0 {
+		t.Fatalf("transaction retained %d transformation prefix entries", len(tx.transformationCache))
+	}
+	if len(tx.transformationStepCache.values) != 0 || tx.transformationStepCache.retainedBytes != 0 {
+		t.Fatalf("transaction retained %d transformation step entries and %d bytes", len(tx.transformationStepCache.values), tx.transformationStepCache.retainedBytes)
 	}
 }
 
