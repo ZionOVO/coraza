@@ -8,13 +8,14 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 )
 
 var errEmptyDirs = errors.New("empty dirs")
 
-func loadFromFile(filepath string, dirs []string, root fs.FS) ([]byte, error) {
-	if path.IsAbs(filepath) {
-		return fs.ReadFile(root, filepath)
+func loadFromFile(filename string, dirs []string, root fs.FS) ([]byte, error) {
+	if path.IsAbs(filename) || filepath.IsAbs(filename) {
+		return fs.ReadFile(root, filename)
 	}
 
 	if len(dirs) == 0 {
@@ -30,7 +31,7 @@ func loadFromFile(filepath string, dirs []string, root fs.FS) ([]byte, error) {
 	)
 
 	for _, p := range dirs {
-		absFilepath := path.Join(p, filepath)
+		absFilepath := path.Join(p, filename)
 		content, err = fs.ReadFile(root, absFilepath)
 		if err != nil {
 			if os.IsNotExist(err) {
