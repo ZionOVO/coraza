@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/corazawaf/coraza/v3/collection"
@@ -693,15 +694,7 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 		// reuse its backing array instead of allocating a second result slice.
 		filteredCount := 0
 		for _, c := range matches {
-			isException := false
-			lkey := strings.ToLower(c.Key())
-			for _, ex := range rv.Exceptions {
-				if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey || (ex.KeyStr == "" && ex.KeyRx == nil) {
-					isException = true
-					break
-				}
-			}
-			if !isException {
+			if !isRuleVariableException(c.Key(), rv.Exceptions) {
 				matches[filteredCount] = c
 				filteredCount++
 			}
@@ -764,15 +757,7 @@ func (tx *Transaction) getFieldMatches(rv ruleVariableParams) []collections.Matc
 	if len(rv.Exceptions) != 0 {
 		filteredCount := 0
 		for _, match := range matches {
-			isException := false
-			lowerKey := strings.ToLower(match.Key)
-			for _, exception := range rv.Exceptions {
-				if (exception.KeyRx != nil && exception.KeyRx.MatchString(lowerKey)) || strings.ToLower(exception.KeyStr) == lowerKey || (exception.KeyStr == "" && exception.KeyRx == nil) {
-					isException = true
-					break
-				}
-			}
-			if !isException {
+			if !isRuleVariableException(match.Key, rv.Exceptions) {
 				matches[filteredCount] = match
 				filteredCount++
 			}
@@ -790,6 +775,56 @@ func (tx *Transaction) getFieldMatches(rv ruleVariableParams) []collections.Matc
 	}
 	tx.fieldMatches = matches
 	return matches
+}
+
+func isRuleVariableException(key string, exceptions []ruleVariableException) bool {
+	var lowerKey string
+	lowerKeyReady := false
+	for _, exception := range exceptions {
+		if exception.KeyStr == "" && exception.KeyRx == nil {
+			return true
+		}
+		if exception.KeyRx != nil {
+			if !lowerKeyReady {
+				lowerKey = strings.ToLower(key)
+				lowerKeyReady = true
+			}
+			if exception.KeyRx.MatchString(lowerKey) {
+				return true
+			}
+		}
+		if lowerKeyReady {
+			if strings.ToLower(exception.KeyStr) == lowerKey {
+				return true
+			}
+		} else if lowercaseStringsEqual(exception.KeyStr, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func lowercaseStringsEqual(left, right string) bool {
+	limit := min(len(left), len(right))
+	for index := range limit {
+		leftByte := left[index]
+		rightByte := right[index]
+		if leftByte >= utf8.RuneSelf || rightByte >= utf8.RuneSelf {
+			// EqualFold accepts additional Unicode folds; exception matching historically compares lowercase forms.
+			//nolint:staticcheck
+			return strings.ToLower(left) == strings.ToLower(right)
+		}
+		if leftByte >= 'A' && leftByte <= 'Z' {
+			leftByte += 'a' - 'A'
+		}
+		if rightByte >= 'A' && rightByte <= 'Z' {
+			rightByte += 'a' - 'A'
+		}
+		if leftByte != rightByte {
+			return false
+		}
+	}
+	return len(left) == len(right)
 }
 
 // RemoveRuleTargetByID removes the VARIABLE:KEY from the rule ID.

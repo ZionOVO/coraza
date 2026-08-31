@@ -1812,6 +1812,35 @@ func TestTxGetFieldMatchesPreservesGetFieldSemantics(t *testing.T) {
 	}
 }
 
+func TestRuleVariableExceptionFastPathPreservesLowercaseSemantics(t *testing.T) {
+	exceptionSets := [][]ruleVariableException{
+		nil,
+		{{}},
+		{{KeyStr: "Cookie"}},
+		{{KeyStr: "K"}},
+		{{KeyStr: "\xff"}},
+		{{KeyRx: regexp.MustCompile(`^cookie$`)}},
+		{{KeyRx: regexp.MustCompile(`^$`)}},
+		{{KeyStr: "other", KeyRx: regexp.MustCompile(`^cookie$`)}},
+	}
+	keys := []string{"", "cookie", "Cookie", "COOKIE", "other", "k", "K", "\xff"}
+	for _, exceptions := range exceptionSets {
+		for _, key := range keys {
+			lowerKey := strings.ToLower(key)
+			want := false
+			for _, exception := range exceptions {
+				if (exception.KeyRx != nil && exception.KeyRx.MatchString(lowerKey)) || strings.ToLower(exception.KeyStr) == lowerKey || (exception.KeyStr == "" && exception.KeyRx == nil) {
+					want = true
+					break
+				}
+			}
+			if have := isRuleVariableException(key, exceptions); have != want {
+				t.Fatalf("key %q exceptions %+v: have %v, want %v", key, exceptions, have, want)
+			}
+		}
+	}
+}
+
 func TestTransactionCloseDropsRequestDataCaches(t *testing.T) {
 	tx := NewWAF().NewTransaction()
 	for index := range maxRetainedTransformationCacheEntries + 1 {

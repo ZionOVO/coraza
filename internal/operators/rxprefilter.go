@@ -20,11 +20,9 @@
 //  2. Required literal pre-filtering — also extracted from the AST. Every regex
 //     has certain literal substrings that *must* appear in any matching input.
 //     For example, `sleep\s*\(` always requires "sleep" and "(". If we can
-//     cheaply confirm those literals are absent, we know the regex cannot match
-//     and skip it. For single literals we use strings.Contains; for alternation
-//     sets (anyRequired) we use a first-byte indexed single-pass scan that
-//     uses a Wu-Manber shift table to skip non-candidate positions in sub-linear
-//     time, verifying only at positions where a match could begin.
+//     cheaply confirm those literals are absent (via strings.Contains for a
+//     single literal, or an Aho-Corasick automaton for alternations), we know
+//     the regex cannot match and skip it.
 //
 // Safety guarantee:
 //
@@ -32,10 +30,10 @@
 //   - "definitely no match" → skip regex (correct: required literals absent)
 //   - "maybe match" → run regex (conservative: may still not match)
 //
-// Every extracted constraint must be a true necessary condition. Violating
-// that invariant can make the prefilter reject an input that the regular
-// expression accepts, so differential and fuzz tests compare every optimized
-// decision with the reference regular expression engine.
+// A bug in literal extraction can only make the prefilter say "maybe" too
+// often (degraded performance), never cause a false negative (missed attack).
+// This is safe by construction — the prefilter is a necessary-condition check,
+// not a sufficient-condition check.
 //
 // Design principle: when in doubt, fall back to the regex. The prefilter is
 // purely an optimization. If there is any uncertainty about whether the input
@@ -68,7 +66,6 @@ package operators
 
 import (
 	"regexp/syntax"
-	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -153,13 +150,14 @@ func minLen(re *syntax.Regexp) int {
 	}
 }
 
+// prefilterFunc returns a function that returns true if the regex might match
+// the input, false if it definitely cannot. Returns nil when no useful
+// prefilter can be built.
 type compiledPrefilter struct {
 	match          func(string) bool
 	matchWithState func(plugintypes.TransactionState, string) bool
 }
 
-// prefilterFunc returns a stateless necessary-condition check for a regular
-// expression. Callers with transaction state should use compilePrefilter.
 func prefilterFunc(pattern string) func(string) bool {
 	return compilePrefilter(pattern).match
 }
@@ -170,223 +168,178 @@ func compilePrefilter(pattern string) compiledPrefilter {
 		return compiledPrefilter{}
 	}
 	re = re.Simplify()
-	caseInsensitive := hasFlag(re, syntax.FoldCase)
-	literals := extractLiterals(re, caseInsensitive)
-	if caseInsensitive && literals != nil && !extractedLiteralsAreASCII(literals) {
-		return compiledPrefilter{}
-	}
-
-	match := buildPrefilterFunc(pattern)
-	if match == nil || literals == nil {
-		return compiledPrefilter{match: match}
-	}
-
-	var needles []string
-	switch values := literals.(type) {
-	case allRequired:
-		if literal := longest(values); literal != "" {
-			needles = []string{literal}
-		}
-	case anyRequired:
-		needles = values
-	case combinedRequired:
-		if literal := longest(values.all); literal != "" {
-			needles = []string{literal}
-		} else {
-			needles = values.any
-		}
-	}
-	if len(needles) == 0 {
-		return compiledPrefilter{match: match}
-	}
-	required := newRequiredByteMatcher(needles, caseInsensitive)
-	return compiledPrefilter{
-		match: match,
-		matchWithState: func(tx plugintypes.TransactionState, value string) bool {
-			return required.matchWithState(tx, value) && match(value)
-		},
-	}
-}
-
-func extractedLiteralsAreASCII(literals any) bool {
-	switch values := literals.(type) {
-	case allRequired:
-		return allASCIIStrings(values)
-	case anyRequired:
-		return allASCIIStrings(values)
-	case combinedRequired:
-		return allASCIIStrings(values.all) && allASCIIStrings(values.any)
-	default:
-		return false
-	}
-}
-
-// buildPrefilterFunc returns a function that returns true if the regex might
-// match the input, false if it definitely cannot.
-func buildPrefilterFunc(pattern string) func(string) bool {
-	re, err := syntax.Parse(pattern, syntax.Perl)
-	if err != nil {
-		return nil
-	}
-	re = re.Simplify()
 
 	caseInsensitive := hasFlag(re, syntax.FoldCase)
-
-	// Compute the minimum byte length any matching input must have.
-	// We use this in two ways:
-	//   1. Prepended to every prefilter as a free O(1) guard that rejects
-	//      inputs shorter than the pattern's minimum match length before
-	//      spending O(H) on a string scan.
-	//   2. As a standalone prefilter when extractLiterals returns nil but
-	//      the minimum length is large enough to be useful (≥ minUsefulMML).
-	//
-	// re is already parsed and simplified above — call minLen directly to
-	// avoid a second syntax.Parse + Simplify call on the same pattern.
-	mml := minLen(re)
 
 	lits := extractLiterals(re, caseInsensitive)
 	if lits == nil {
-		// No literals extractable. Fall back to a length-only prefilter when
-		// the minimum match length is large enough to actually reject inputs.
-		// Most WAF field values are > 3 bytes, so thresholds below 4 are not
-		// worth the function-call overhead.
-		const minUsefulMML = 4
-		if mml >= minUsefulMML {
-			return func(s string) bool { return len(s) >= mml }
-		}
-		return nil
+		return compiledPrefilter{}
+	}
+	// Byte-level case folding is only equivalent to Go's regular-expression
+	// folding for ASCII literals. In particular, a cached bitmap for "é" would
+	// reject "É" before the regular-expression engine can apply Unicode folding.
+	if caseInsensitive && !extractedLiteralsAreASCII(lits) {
+		return compiledPrefilter{}
 	}
 
 	var pf func(string) bool
+	var cacheMatcher *requiredByteMatcher
+	populateCache := false
 
 	switch v := lits.(type) {
 	case allRequired:
 		// allRequired: every literal must be present in the input.
 		// Example: pattern "hello.*world" yields allRequired{"hello", "world"}.
-		//
-		// Gap 1: when the pattern is start/end-anchored, the first/last literal
-		// must appear at position 0/end — use HasPrefix/HasSuffix instead of
-		// Contains for a faster O(k) check that also raises the reject rate.
-		//
-		// Gap 3: for non-anchored patterns, sort longest-first so the most
-		// selective literal is checked first, maximising early exit.
-
-		// Save origFirst/origLast before filterShort mutates the slice in-place.
-		origFirst := ""
-		if len(v) > 0 {
-			origFirst = v[0]
-		}
-		origLast := ""
-		if len(v) > 0 {
-			origLast = v[len(v)-1]
-		}
+		// We check each with strings.Contains; if any is absent, regex can't match.
 		filtered := filterShort(v, 2)
 		if len(filtered) == 0 {
-			return nil
+			// A one-byte required literal is still useful when no longer literal
+			// exists. Keep one necessary byte instead of abandoning the filter.
+			filtered = []string{longest(v)}
 		}
-		// A literal is the prefix/suffix constraint only when it survived
-		// filterShort (len >= 2), meaning it IS the first/last literal in the
-		// pattern and not replaced by a longer one that appeared elsewhere.
-		usePrefix := hasAnchoredLiteralPrefix(re, origFirst, caseInsensitive)
-		useSuffix := hasAnchoredLiteralSuffix(re, origLast, caseInsensitive)
-		if !usePrefix && !useSuffix {
-			// No anchor: sort longest-first for best early exit.
-			slices.SortFunc(filtered, func(a, b string) int { return len(b) - len(a) })
+		switch {
+		case len(filtered) == 1:
+			needle := filtered[0]
+			if caseInsensitive {
+				matcher := newFoldedLiteralMatcher(needle)
+				pf = matcher.match
+			} else {
+				pf = func(s string) bool {
+					return strings.Contains(s, needle)
+				}
+			}
+		case caseInsensitive:
+			matchers := newFoldedLiteralMatchers(filtered)
+			pf = func(s string) bool {
+				for _, matcher := range matchers {
+					if !matcher.match(s) {
+						return false
+					}
+				}
+				return true
+			}
+		default:
+			pf = func(s string) bool {
+				for _, needle := range filtered {
+					if !strings.Contains(s, needle) {
+						return false
+					}
+				}
+				return true
+			}
 		}
-		pf = buildMultiNeedlePF(filtered, caseInsensitive, usePrefix, useSuffix)
-
-	case combinedRequired:
-		// combinedRequired: both allRequired and anyRequired constraints must hold.
-		// Check allRequired (Contains/HasPrefix) first, then anyRequired (indexedMatcher).
-		pf = buildCombinedPF(v, caseInsensitive, re)
-
+		cacheMatcher = newRequiredByteMatcher([]string{longest(filtered)}, caseInsensitive)
 	case anyRequired:
 		// anyRequired: at least one literal must be present in the input.
 		// Example: pattern "(?:union|insert)" yields anyRequired{"union", "insert"}.
+		// We use Aho-Corasick to scan for any of them in a single pass.
 		//
-		// SAFETY: Do NOT use filterShort here. For anyRequired, removing a short
-		// element changes the semantics from "one of {A,B,C}" to "one of {A,B}" —
-		// if the match was through branch C (removed), we'd miss it. Instead, if
-		// any element is too short to be useful, abandon the prefilter entirely.
-		if anyTooShort(v, 2) {
-			return nil
+		// SAFETY: Do not filter short alternatives. Removing one changes the
+		// semantics and can create a false negative. Empty alternatives cannot
+		// constrain a match, while one-byte alternatives remain in the matcher.
+		if anyTooShort(v, 1) {
+			return compiledPrefilter{}
 		}
 		filtered := v
 		switch {
 		case len(filtered) == 1:
 			needle := filtered[0]
 			if caseInsensitive {
-				pf = func(s string) bool {
-					return containsFoldASCII(s, needle)
-				}
+				matcher := newFoldedLiteralMatcher(needle)
+				pf = matcher.match
 			} else {
 				pf = func(s string) bool {
 					return strings.Contains(s, needle)
 				}
 			}
 		case caseInsensitive && !allASCIIStrings([]string(filtered)):
-			// Our matchers use ASCII-only folding. If any needle is non-ASCII,
-			// it could fold to an ASCII equivalent under Go's Unicode case
-			// rules — causing a false negative. Bail out.
-			return nil
-		case len(filtered) <= anyRequiredMaxN:
-			// Wu-Manber shift-table matcher. Sub-linear scanning examines only
-			// ~H/minLen positions on average. Zero allocations.
-			// For large N (>16), the shift table fills up with more zeros, but
-			// benchmarks show it still outperforms any AC library for typical
-			// WAF inputs (50-2000 B) because AC SIMD prefilters call
-			// bytes.IndexByte once per unique start byte — O(H×K) in practice.
-			im := newIndexedMatcher(filtered, caseInsensitive)
-			pf = im.match
+			// When case-insensitive, Aho-Corasick uses ASCII-only folding. If any
+			// needle is non-ASCII (e.g. "ſelect" lowercased from "Select"), it could
+			// fold to an ASCII equivalent under Go's Unicode case rules — meaning a
+			// pure-ASCII input like "select" would match (?i)ſelect but the automaton
+			// wouldn't find "ſelect" in "select". To avoid false negatives, bail out.
+			return compiledPrefilter{}
+		case anyTooShort(filtered, 2):
+			// Multiple independent one-byte searches rescan large bodies. A
+			// required-byte set handles short and long alternatives in one pass.
+			cacheMatcher = newRequiredByteMatcher(filtered, caseInsensitive)
+			populateCache = true
+			pf = cacheMatcher.match
+		case len(filtered) <= linearAnyRequiredMaxNeedles && caseInsensitive:
+			matchers := newFoldedLiteralMatchers(filtered)
+			pf = func(s string) bool {
+				for _, matcher := range matchers {
+					if matcher.match(s) {
+						return true
+					}
+				}
+				return false
+			}
+		case len(filtered) <= linearAnyRequiredMaxNeedles:
+			pf = func(s string) bool {
+				for _, needle := range filtered {
+					if strings.Contains(s, needle) {
+						return true
+					}
+				}
+				return false
+			}
+		case len(filtered) <= anyRequiredMaxNeedles:
+			matcher := newIndexedMatcher(filtered, caseInsensitive)
+			pf = matcher.match
 		default:
-			// N > anyRequiredMaxN: too many needles for Wu-Manber to be
-			// effective (nearly every haystack byte is a candidate). In
-			// practice regexp/syntax.Simplify() factors large alternations
-			// into tries with single-byte literals at each branch, causing
-			// extractLiterals to return nil before we ever reach this branch.
-			// If we do reach it, bail out and let the full regex run —
-			// correctness over performance.
-			return nil
+			// A dense exact matcher becomes expensive for assembled rules with
+			// thousands of alternatives. Every alternative still contains either
+			// a required byte or byte pair, which gives a bounded coarse filter.
+			cacheMatcher = newRequiredByteMatcher(filtered, caseInsensitive)
+			populateCache = true
+			pf = cacheMatcher.match
+		}
+		if cacheMatcher == nil {
+			cacheMatcher = newRequiredByteMatcher(filtered, caseInsensitive)
 		}
 	}
 
 	if pf == nil {
-		return nil
+		return compiledPrefilter{}
 	}
-
-	// Prepend a free O(1) length guard to the literal scan.  If the input
-	// is shorter than the minimum possible match length it can't match —
-	// reject immediately before spending O(H) on string searches.
-	// Only bother when mml is large enough to ever fire in practice.
-	const minUsefulMML = 4
-	if mml >= minUsefulMML {
-		inner := pf
-		pf = func(s string) bool {
-			return len(s) >= mml && inner(s)
+	var stateful func(plugintypes.TransactionState, string) bool
+	if populateCache {
+		stateful = cacheMatcher.matchWithState
+	} else if cacheMatcher != nil {
+		baseMatch := pf
+		stateful = func(tx plugintypes.TransactionState, value string) bool {
+			if !cacheMatcher.possibleFromCache(tx, value) {
+				return false
+			}
+			return baseMatch(value)
 		}
 	}
 
-	// When case-insensitive matching is active, our prefilter only performs
-	// ASCII case folding (A-Z ↔ a-z). Go's regexp with (?i) uses full Unicode
-	// simple case folding, where two ASCII letters have non-ASCII equivalents:
-	//   - 's' ↔ 'ſ' (U+017F, Latin Small Letter Long S)
-	//   - 'k' ↔ 'K' (U+212A, Kelvin Sign)
-	// For pure-ASCII inputs this is not an issue — ASCII folding is complete.
-	// For inputs containing non-ASCII bytes, we conservatively return true
-	// ("maybe match") and let the full regex engine decide. This ensures we
-	// never produce a false negative from Unicode folding mismatches.
-	// In practice, 99%+ of WAF traffic is ASCII, so this rarely triggers.
+	// When case-insensitive matching is active, the prefilter performs ASCII
+	// folding. Go regular expressions additionally fold ASCII s and k with the
+	// non-ASCII long-s and Kelvin-sign runes. Check those two exceptions after
+	// a negative prefilter result instead of scanning the whole input up front.
 	if caseInsensitive {
 		inner := pf
-		return func(s string) bool {
-			if !isASCII(s) {
+		pf = func(s string) bool {
+			if inner(s) {
 				return true
 			}
-			return inner(s)
+			return strings.Contains(s, "ſ") || strings.Contains(s, "K")
+		}
+		if stateful != nil {
+			innerStateful := stateful
+			stateful = func(tx plugintypes.TransactionState, s string) bool {
+				if innerStateful(tx, s) {
+					return true
+				}
+				return strings.Contains(s, "ſ") || strings.Contains(s, "K")
+			}
 		}
 	}
 
-	return pf
+	return compiledPrefilter{match: pf, matchWithState: stateful}
 }
 
 // literal extraction types
@@ -397,12 +350,15 @@ type allRequired []string
 // anyRequired means at least one string in the slice must appear in the input.
 type anyRequired []string
 
-// combinedRequired means every literal in 'all' must be present in the input
-// AND at least one literal in 'any' must be present. Both constraints are
-// necessary conditions extracted from different parts of the same regex.
-type combinedRequired struct {
-	all allRequired
-	any anyRequired
+func extractedLiteralsAreASCII(literals interface{}) bool {
+	switch values := literals.(type) {
+	case allRequired:
+		return allASCIIStrings(values)
+	case anyRequired:
+		return allASCIIStrings(values)
+	default:
+		return false
+	}
 }
 
 // extractLiterals walks the regex AST and returns the required literal substrings
@@ -428,39 +384,39 @@ func extractLiterals(re *syntax.Regexp, ci bool) interface{} {
 		if ci {
 			s = strings.ToLower(s)
 		}
-		// Single-byte literals are too common and not selective enough to filter on.
-		if len(s) < 2 {
+		return allRequired{s}
+
+	case syntax.OpCharClass:
+		// Small positive byte classes are useful alternatives in assembled
+		// expressions, especially punctuation branches such as [;{}]. Large,
+		// Unicode, and negated classes stay with the full regex engine.
+		const maxClassLiterals = 64
+		var literals []string
+		for index := 0; index+1 < len(re.Rune); index += 2 {
+			low, high := re.Rune[index], re.Rune[index+1]
+			if low < 0 || high > unicode.MaxASCII || high-low+1 > maxClassLiterals-int32(len(literals)) {
+				return nil
+			}
+			for value := low; value <= high; value++ {
+				literal := string(value)
+				if ci {
+					literal = strings.ToLower(literal)
+				}
+				literals = append(literals, literal)
+			}
+		}
+		if len(literals) == 0 {
 			return nil
 		}
-		return allRequired{s}
+		return anyRequired(literals)
 
 	case syntax.OpCapture:
 		// Capture groups are transparent for literal extraction.
 		return extractLiterals(re.Sub[0], ci)
 
 	case syntax.OpConcat:
-		// Collect required literals from every non-optional child.
-		//
-		// allRequired: every literal must appear → strongest constraint.
-		// anyRequired: at least one of these must appear → weaker, but still
-		//   a valid necessary condition because the child is not optional.
-		//   OpQuest and OpStar children already return nil, so any anyRequired
-		//   we see here came from a mandatory child of the concat.
-		//
-		// When multiple anyRequired sets are collected (e.g. two keyword
-		// alternations), we keep the most restrictive one — the set with the
-		// fewest elements — because it is the hardest for benign traffic to
-		// satisfy and therefore gives the best skip rate.  Both are correct
-		// (either one is a valid necessary condition); the shorter one is
-		// simply a better prefilter.
-		//
-		// Example: (?:^|["':;=])\s*(?:select|union|drop)
-		//   child 0: (?:^|["':;=])  → nil (^ branch makes whole alt nil)
-		//   child 1: \s*             → nil (star)
-		//   child 2: (?:select|…)   → anyRequired{"select","union","drop"}
-		//   → return anyRequired{"select","union","drop"}
 		var all []string
-		var bestAny anyRequired
+		var alternatives []anyRequired
 		for _, sub := range re.Sub {
 			lits := extractLiterals(sub, ci)
 			if lits == nil {
@@ -470,67 +426,26 @@ func extractLiterals(re *syntax.Regexp, ci bool) interface{} {
 			case allRequired:
 				all = append(all, v...)
 			case anyRequired:
-				if bestAny == nil || len(v) < len(bestAny) {
-					bestAny = v
-				}
+				// Every concatenated child must match. Preserve its complete
+				// alternative set as one possible necessary-condition filter.
+				alternatives = append(alternatives, v)
 			}
 		}
-		if len(all) > 0 {
-			// Gap 4: when a mandatory child also contributes an anyRequired
-			// constraint (e.g. `SELECT.*FROM.*(?:users|accounts)`), combining
-			// both makes the prefilter strictly more selective.
-			if bestAny != nil && !anyTooShort(bestAny, 2) {
-				return combinedRequired{all: allRequired(all), any: bestAny}
+		best := bestAnyRequired(alternatives)
+		if len(all) != 0 {
+			// Both conditions are necessary. Prefer an alternative group only
+			// when even its shortest literal is longer than the strongest fixed
+			// literal; this avoids reducing factored words such as x(?:args|term)
+			// to the unselective one-byte prefix x.
+			if len(best) != 0 && shortestLength(best) > len(longest(all)) {
+				return best
 			}
 			return allRequired(all)
 		}
-
-		// Try trie reconstruction BEFORE falling back to the raw anyRequired
-		// propagation. Trie reconstruction prepends the short common prefix to
-		// each suffix, producing longer and more selective literals — e.g.
-		//
-		//   s(?:e(?:lect|t)|leep)  →  anyRequired{"select","set","sleep"}
-		//
-		// The anyRequired propagation alone would yield {"elect","et","leep"};
-		// "et" is a substring of ordinary words ("GET", "better", …) and would
-		// let far too much benign traffic through to the full regex.
-		//
-		// Try trie reconstruction for patterns that regexp/syntax.Simplify()
-		// emits when factoring common prefixes out of large alternations:
-		//
-		//   select|sleep|substr  →  s(?:elect|leep|ubstr)
-		//   union|update         →  u(?:nion|pdate)
-		//
-		// The AST is OpConcat([OpLiteral("s"), OpAlternate([...])]).
-		// extractLiterals(OpLiteral("s")) returns nil (1 byte, too short), so
-		// the standard path above produces nothing. We detect this pattern and
-		// reconstruct the full words by prepending the raw prefix to each branch.
-		//
-		// This enables prefiltering for large CRS alternation patterns that the
-		// standard path would silently skip.
-		//
-		// IMPORTANT: trieReconstruct returns a concrete anyRequired type. When
-		// that nil concrete value is returned directly as interface{}, Go wraps
-		// it as (type=anyRequired, value=nil), which is != nil as an interface.
-		// The callers in OpAlternate check `if lits == nil` — they'd see the
-		// non-nil interface and treat it as a valid (empty) result, silently
-		// building a wrong prefilter. Explicitly return nil (the interface nil).
-		if result := trieReconstruct(re, ci); result != nil {
-			return result
+		if len(best) == 0 {
+			return nil
 		}
-
-		// Last resort: fall back to the anyRequired collected from required
-		// children. This handles patterns like:
-		//   (?:^|["':;=])\s*(?:select|union|drop)
-		// where (?:^|…) has no extractable literal (^ branch makes it nil)
-		// but the keyword alternation does. We couldn't use it above because
-		// trieReconstruct (which prepends a common prefix) takes priority and
-		// might have been able to produce better literals — but it didn't, so
-		// this is the best we can do.
-		if bestAny != nil {
-			return bestAny
-		}
-		return nil
+		return best
 
 	case syntax.OpAlternate:
 		// For alternation (a|b|c), exactly one branch must match. So we need
@@ -556,15 +471,6 @@ func extractLiterals(re *syntax.Regexp, ci bool) interface{} {
 				// Example: pattern `10|(10|00)` — branch B is anyRequired{"10","00"},
 				// if we only kept "10" we'd miss input "00".
 				branchLits = append(branchLits, v...)
-			case combinedRequired:
-				// combinedRequired means every element of .all AND at least one
-				// element of .any must be present when this branch fires.
-				// For the parent anyRequired we need at least one guaranteed literal
-				// per branch. The .any elements satisfy exactly that — when this
-				// branch fires, at least one of .any is guaranteed to be present.
-				// Mirror the anyRequired case: merge all .any elements so no branch
-				// representative is accidentally omitted.
-				branchLits = append(branchLits, []string(v.any)...)
 			}
 		}
 		if len(branchLits) == 0 {
@@ -589,156 +495,38 @@ func extractLiterals(re *syntax.Regexp, ci bool) interface{} {
 	}
 }
 
-// trieReconstruct handles the specific pattern that regexp/syntax.Simplify()
-// emits when factoring a common prefix from an alternation:
-//
-//	select|sleep|substr  →  s(?:elect|leep|ubstr)
-//	    AST: OpConcat([OpLiteral("s"), OpAlternate([...])])
-//
-// It prepends the raw prefix literal to every element returned by
-// rawExtractSuffixes, recovering the full literal words. The result is returned
-// as anyRequired so the caller knows "at least one of these must be present".
-//
-// Handles arbitrary nesting depth: rawExtractSuffixes recurses back into
-// extractLiterals → trieReconstruct for inner OpConcat nodes, so patterns like
-//
-//	select|set|sleep  →  s(?:e(?:lect|t)|leep)
-//
-// also reconstruct correctly ("select", "set", "sleep").
-func trieReconstruct(concat *syntax.Regexp, ci bool) anyRequired {
-	// Only handle the exact 2-child pattern [short_prefix, alternation] that
-	// regexp/syntax.Simplify() emits. Longer concats (e.g. a.*b) have
-	// intervening optional/unknown nodes that we must not skip over, as doing
-	// so would produce false negatives (e.g. "ab" present without "axb" being
-	// a valid match for a.*b).
-	if concat.Op != syntax.OpConcat || len(concat.Sub) != 2 {
-		return nil
-	}
-
-	// Extract the raw prefix literal (may be 1 byte — that's the common case).
-	prefix := rawLiteral(concat.Sub[0], ci)
-	if prefix == "" {
-		return nil
-	}
-
-	// Collect suffix candidates from remaining children using the permissive
-	// extractor that allows short literals (they will be combined with prefix).
-	var suffixes []string
-	for _, sub := range concat.Sub[1:] {
-		lits := rawExtractSuffixes(sub, ci)
-		if lits == nil {
+func bestAnyRequired(groups []anyRequired) anyRequired {
+	var best anyRequired
+	bestMinLen := 0
+	for _, group := range groups {
+		if len(group) == 0 {
 			continue
 		}
-		suffixes = append(suffixes, lits...)
-	}
-	if len(suffixes) == 0 {
-		return nil
-	}
-
-	result := make(anyRequired, 0, len(suffixes))
-	for _, s := range suffixes {
-		if full := prefix + s; len(full) >= 2 {
-			result = append(result, full)
-		}
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
-}
-
-// rawExtractSuffixes extracts literal candidates from a regex subtree for use
-// as trie-reconstruction suffixes. Unlike extractLiterals it permits short
-// literals (< 2 bytes) because they will be combined with a prefix by the
-// caller, producing a longer and more selective string.
-//
-// Returns nil if any branch of an alternation has no extractable literal (same
-// semantics as extractLiterals for OpAlternate: we can't safely omit a branch).
-func rawExtractSuffixes(re *syntax.Regexp, ci bool) []string {
-	switch re.Op {
-	case syntax.OpLiteral:
-		s := rawLiteral(re, ci)
-		if s == "" {
-			return nil
-		}
-		return []string{s}
-
-	case syntax.OpAlternate:
-		var result []string
-		for _, sub := range re.Sub {
-			lits := rawExtractSuffixes(sub, ci)
-			if lits == nil {
-				return nil // one branch has no extractable suffix → bail
-			}
-			result = append(result, lits...)
-		}
-		return result
-
-	case syntax.OpConcat:
-		// Try the full extractLiterals pipeline first (handles deeper nesting
-		// through the trieReconstruct fallback it already calls).
-		lits := extractLiterals(re, ci)
-		if lits != nil {
-			switch v := lits.(type) {
-			case allRequired:
-				// Only safe to return a single trie suffix when the concat
-				// collapses to exactly one contiguous literal. Multiple
-				// allRequired elements mean there are wildcards between them
-				// (e.g. "elect.*from" → allRequired{"elect","from"}). Joining
-				// them would produce "electfrom" — a phantom string that never
-				// appears contiguously in a real input — causing false negatives
-				// on valid matches like "select x from". Return nil here so the
-				// caller falls back to the safer anyRequired propagation instead.
-				if len(v) == 1 {
-					return []string{v[0]}
-				}
-				return nil
-			case anyRequired:
-				return []string(v)
-			case combinedRequired:
-				// For trie-reconstruction we need a suffix that is *always* present
-				// when this sub-concat fires. The .all elements are guaranteed;
-				// .any elements are only conditionally present (one of them must be
-				// present, but not a specific one). Returning a .any element would
-				// let the outer prefix combine with a wrong suffix (e.g. "s"+"execute"
-				// instead of "s"+"p_"+"execute" → "sp_execute"), producing a phantom
-				// literal that never appears contiguously in real input.
-				// Return the single longest .all element as the guaranteed suffix.
-				rep := longest([]string(v.all))
-				if rep == "" {
-					return nil
-				}
-				return []string{rep}
+		minLen := len(group[0])
+		for _, literal := range group[1:] {
+			if len(literal) < minLen {
+				minLen = len(literal)
 			}
 		}
-		return nil
-
-	case syntax.OpCapture:
-		return rawExtractSuffixes(re.Sub[0], ci)
-
-	default:
-		return nil
-	}
-}
-
-// rawLiteral returns the string content of an OpLiteral node without applying
-// any minimum-length filter. Returns "" if the node is not a valid literal.
-// Used for trie reconstruction where short prefixes are intentionally combined
-// with alternation branches to form longer, more selective literals.
-func rawLiteral(re *syntax.Regexp, ci bool) string {
-	if re.Op != syntax.OpLiteral {
-		return ""
-	}
-	for _, r := range re.Rune {
-		if r == utf8.RuneError {
-			return ""
+		if minLen > bestMinLen || minLen == bestMinLen && (best == nil || len(group) < len(best)) {
+			best = group
+			bestMinLen = minLen
 		}
 	}
-	s := string(re.Rune)
-	if ci {
-		s = strings.ToLower(s)
+	return best
+}
+
+func shortestLength(values []string) int {
+	if len(values) == 0 {
+		return 0
 	}
-	return s
+	shortest := len(values[0])
+	for _, value := range values[1:] {
+		if len(value) < shortest {
+			shortest = len(value)
+		}
+	}
+	return shortest
 }
 
 // hasFlag reports whether the flag is set on any node in the regex tree.
@@ -786,34 +574,28 @@ func anyTooShort(ss []string, minLen int) bool {
 // (e.g. single characters) are too common across inputs to be effective filters.
 // SAFETY: Only safe for allRequired (removing a needle makes the check less strict).
 // Never use for anyRequired — use anyTooShort instead.
-//
-// Compacts in place to avoid a heap allocation when all (or most) elements pass.
 func filterShort(ss []string, minLen int) []string {
-	k := 0
+	result := ss[:0:0]
 	for _, s := range ss {
 		if len(s) >= minLen {
-			ss[k] = s
-			k++
+			result = append(result, s)
 		}
 	}
-	return ss[:k]
+	return result
 }
 
-// anyRequiredMaxN is an upper bound on the number of needles we will build an
-// indexedMatcher for. Beyond this count the Wu-Manber shift table fills up with
-// zeros (every haystack byte is a candidate position), so the sub-linear skip
-// degenerates — but even in the degenerate case the 256-byte table and small
-// per-bucket cost beats any Aho-Corasick library for typical WAF inputs
-// (50-2000 byte values), because AC SIMD prefilters call bytes.IndexByte once
-// per unique start byte — O(H × K) when K (unique first bytes) is large.
-//
-// 256 covers even the largest CRS alternation sets seen in practice.
-// Raise if profiling shows Wu-Manber still wins beyond that.
-const anyRequiredMaxN = 256
+// anyRequiredMaxNeedles bounds the pattern set used by indexedMatcher. Above
+// this count its shift table tends to saturate and loses its sub-linear skips.
+const anyRequiredMaxNeedles = 256
 
-// requiredByteMatcher checks a necessary byte set before an indexed search.
-// The selected set intersects every candidate literal, so absence proves that
-// none of the literals can match while presence remains only a maybe-match.
+// Small literal sets are faster as independent byte searches because the
+// standard library uses platform-optimized substring search for each needle.
+const linearAnyRequiredMaxNeedles = 32
+
+// requiredByteMatcher is a bounded coarse filter for very large alternative
+// sets. Its byte set intersects every alternative literal, so a matching input
+// must contain at least one selected byte. False positives are allowed; false
+// negatives are not.
 type requiredByteMatcher struct {
 	bytes      [256]bool
 	bits       [4]uint64
@@ -858,7 +640,8 @@ func newRequiredByteMatcher(needles []string, caseFold bool) *requiredByteMatche
 		}
 		best := byte(0)
 		for value := 1; value < len(counts); value++ {
-			if counts[value] > counts[best] || counts[value] == counts[best] && byteRarity(byte(value)) > byteRarity(best) {
+			if counts[value] > counts[best] ||
+				counts[value] == counts[best] && byteRarity(byte(value)) > byteRarity(best) {
 				best = byte(value)
 			}
 		}
@@ -907,7 +690,8 @@ func (matcher *requiredByteMatcher) match(value string) bool {
 		return strings.ContainsAny(value, matcher.characters)
 	}
 	for index := range len(value) {
-		if matcher.bytes[value[index]] {
+		current := value[index]
+		if matcher.bytes[current] {
 			return true
 		}
 	}
@@ -975,165 +759,240 @@ func containsByte(values []byte, target byte) bool {
 	return false
 }
 
-// indexedMatcher performs sub-linear multi-pattern substring matching using a
-// Wu-Manber style shift table. Instead of examining every byte in the haystack,
-// it slides a window of size minLen and looks at the byte at the window's right
-// edge. A precomputed shift table tells it how far to jump: if the byte doesn't
-// appear near the end of any needle, the window can advance by up to minLen
-// bytes at once. Only when the shift is zero (a potential match position) does
-// it verify against the small set of candidate needles.
-//
-// Average case: O(H/minLen) — for typical CRS keywords (minLen ≈ 5-6), this
-// examines only ~1/5 to ~1/6 of the haystack bytes, versus O(H) for the
-// bitmap approach or Aho-Corasick.
-//
-// This beats Aho-Corasick for small pattern sets (N < ~20) because:
-//   - Sub-linear scanning vs AC's strict O(H) single-pass
-//   - Zero allocations (AC's Iter/Match pattern allocates per call)
-//   - Better cache behavior (256-byte table vs large DFA transition table)
+// indexedMatcher implements a Wu-Manber-style multi-pattern search. It uses
+// the shortest needle as a window and only verifies candidates when the byte
+// at the window edge can end a needle prefix.
 type indexedMatcher struct {
-	shift      [256]uint8    // shift distance per byte value; 0 = candidate position
-	endBuckets [256][]string // needles grouped by their byte at position minLen-1
-	minLen     int
-	ci         bool
-	required   *requiredByteMatcher
+	shift       [256]uint8
+	endBuckets  [256][]string
+	pairShift   []uint8
+	pairBuckets map[uint16][]string
+	minLen      int
+	caseFold    bool
+	required    *requiredByteMatcher
 }
 
-func newIndexedMatcher(needles []string, ci bool) *indexedMatcher {
+func newIndexedMatcher(needles []string, caseFold bool) *indexedMatcher {
 	if len(needles) == 0 {
-		return &indexedMatcher{ci: ci, minLen: 0}
+		return &indexedMatcher{caseFold: caseFold}
 	}
-	im := &indexedMatcher{ci: ci}
-
-	im.minLen = len(needles[0])
-	for _, n := range needles[1:] {
-		if len(n) < im.minLen {
-			im.minLen = len(n)
+	normalized := needles
+	if caseFold {
+		normalized = make([]string, len(needles))
+		for i, needle := range needles {
+			normalized[i] = lowerASCII(needle)
 		}
 	}
-
-	ml := im.minLen
-	if ml > 255 {
-		ml = 255
+	matcher := &indexedMatcher{
+		caseFold: caseFold,
+		minLen:   len(normalized[0]),
+		required: newRequiredByteMatcher(normalized, caseFold),
 	}
-	for i := range im.shift {
-		im.shift[i] = uint8(ml)
-	}
-
-	// Normalize needles to lowercase for CI mode.
-	norms := needles
-	if ci {
-		norms = make([]string, len(needles))
-		for i, n := range needles {
-			norms[i] = strings.ToLower(n)
+	for _, needle := range normalized[1:] {
+		if len(needle) < matcher.minLen {
+			matcher.minLen = len(needle)
 		}
 	}
-	im.required = newRequiredByteMatcher(norms, ci)
+	if matcher.minLen >= 2 {
+		matcher.buildPairIndex(normalized)
+		return matcher
+	}
 
-	for _, n := range norms {
-		for j := 0; j < im.minLen; j++ {
-			sh := uint8(im.minLen - 1 - j)
-			c := n[j]
-			if sh < im.shift[c] {
-				im.shift[c] = sh
+	maxShift := matcher.minLen
+	if maxShift > 255 {
+		maxShift = 255
+	}
+	for i := range matcher.shift {
+		matcher.shift[i] = uint8(maxShift)
+	}
+
+	for _, needle := range normalized {
+		for i := 0; i < matcher.minLen; i++ {
+			shift := uint8(matcher.minLen - 1 - i)
+			c := needle[i]
+			if shift < matcher.shift[c] {
+				matcher.shift[c] = shift
 			}
-			if ci && c >= 'a' && c <= 'z' {
+			if caseFold && c >= 'a' && c <= 'z' {
 				upper := c - ('a' - 'A')
-				if sh < im.shift[upper] {
-					im.shift[upper] = sh
+				if shift < matcher.shift[upper] {
+					matcher.shift[upper] = shift
 				}
 			}
 		}
 	}
-
-	for _, n := range norms {
-		c := n[im.minLen-1]
-		im.endBuckets[c] = append(im.endBuckets[c], n)
+	for _, needle := range normalized {
+		c := needle[matcher.minLen-1]
+		matcher.endBuckets[c] = append(matcher.endBuckets[c], needle)
 	}
-
-	return im
+	return matcher
 }
 
-func (m *indexedMatcher) match(s string) bool {
-	if m.ci {
-		return m.matchCI(s)
+func (matcher *indexedMatcher) buildPairIndex(needles []string) {
+	matcher.pairShift = make([]uint8, 1<<16)
+	maxShift := matcher.minLen - 1
+	if maxShift > 255 {
+		maxShift = 255
 	}
-	return m.matchCS(s)
+	for i := range matcher.pairShift {
+		matcher.pairShift[i] = uint8(maxShift)
+	}
+	for _, needle := range needles {
+		for i := 0; i <= matcher.minLen-2; i++ {
+			shift := uint8(matcher.minLen - 2 - i)
+			pair := bytePair(needle[i], needle[i+1])
+			if shift < matcher.pairShift[pair] {
+				matcher.pairShift[pair] = shift
+			}
+		}
+	}
+	matcher.pairBuckets = make(map[uint16][]string, len(needles))
+	for _, needle := range needles {
+		pair := bytePair(needle[matcher.minLen-2], needle[matcher.minLen-1])
+		matcher.pairBuckets[pair] = append(matcher.pairBuckets[pair], needle)
+	}
 }
 
-func (m *indexedMatcher) matchWithState(tx plugintypes.TransactionState, value string) bool {
-	if m.required != nil && !m.required.possibleFromCache(tx, value) {
+func bytePair(first, second byte) uint16 {
+	return uint16(first)<<8 | uint16(second)
+}
+
+func foldedBytePair(first, second byte) uint16 {
+	if first >= 'A' && first <= 'Z' {
+		first += 'a' - 'A'
+	}
+	if second >= 'A' && second <= 'Z' {
+		second += 'a' - 'A'
+	}
+	return bytePair(first, second)
+}
+
+func (matcher *indexedMatcher) match(value string) bool {
+	if matcher.caseFold {
+		return matcher.matchFold(value)
+	}
+	return matcher.matchCaseSensitive(value)
+}
+
+func (matcher *indexedMatcher) matchWithState(tx plugintypes.TransactionState, value string) bool {
+	if matcher.required != nil && !matcher.required.possibleFromCache(tx, value) {
 		return false
 	}
-	return m.match(value)
+	return matcher.match(value)
 }
 
-func (m *indexedMatcher) matchCS(s string) bool {
-	ml := m.minLen
-	if ml == 0 || len(s) < ml {
+func (matcher *indexedMatcher) matchCaseSensitive(value string) bool {
+	minLen := matcher.minLen
+	if minLen == 0 || len(value) < minLen {
 		return false
 	}
-	i := ml - 1
-	for i < len(s) {
-		sh := m.shift[s[i]]
-		if sh != 0 {
-			i += int(sh)
+	if matcher.pairShift != nil {
+		for end := minLen - 1; end < len(value); {
+			pair := bytePair(value[end-1], value[end])
+			shift := matcher.pairShift[pair]
+			if shift != 0 {
+				end += int(shift)
+				continue
+			}
+			start := end - minLen + 1
+			for _, needle := range matcher.pairBuckets[pair] {
+				if matchEnd := start + len(needle); matchEnd <= len(value) && value[start:matchEnd] == needle {
+					return true
+				}
+			}
+			end++
+		}
+		return false
+	}
+	for index := minLen - 1; index < len(value); {
+		shift := matcher.shift[value[index]]
+		if shift != 0 {
+			index += int(shift)
 			continue
 		}
-		pos := i - ml + 1
-		for _, needle := range m.endBuckets[s[i]] {
-			nlen := len(needle)
-			if pos+nlen <= len(s) && s[pos:pos+nlen] == needle {
+		start := index - minLen + 1
+		for _, needle := range matcher.endBuckets[value[index]] {
+			if end := start + len(needle); end <= len(value) && value[start:end] == needle {
 				return true
 			}
 		}
-		i++
+		index++
 	}
 	return false
 }
 
-func (m *indexedMatcher) matchCI(s string) bool {
-	ml := m.minLen
-	if ml == 0 || len(s) < ml {
+func (matcher *indexedMatcher) matchFold(value string) bool {
+	minLen := matcher.minLen
+	if minLen == 0 || len(value) < minLen {
 		return false
 	}
-	i := ml - 1
-	for i < len(s) {
-		b := s[i]
-		sh := m.shift[b]
-		if sh != 0 {
-			i += int(sh)
+	if matcher.pairShift != nil {
+		for end := minLen - 1; end < len(value); {
+			pair := foldedBytePair(value[end-1], value[end])
+			shift := matcher.pairShift[pair]
+			if shift != 0 {
+				end += int(shift)
+				continue
+			}
+			start := end - minLen + 1
+			for _, needle := range matcher.pairBuckets[pair] {
+				if matchEnd := start + len(needle); matchEnd <= len(value) && equalFoldASCIIBytes(value[start:matchEnd], needle) {
+					return true
+				}
+			}
+			end++
+		}
+		return false
+	}
+	for index := minLen - 1; index < len(value); {
+		c := value[index]
+		shift := matcher.shift[c]
+		if shift != 0 {
+			index += int(shift)
 			continue
 		}
-		lb := b
-		if lb >= 'A' && lb <= 'Z' {
-			lb += 'a' - 'A'
+		lower := c
+		if lower >= 'A' && lower <= 'Z' {
+			lower += 'a' - 'A'
 		}
-		pos := i - ml + 1
-		for _, needle := range m.endBuckets[lb] {
-			nlen := len(needle)
-			if pos+nlen <= len(s) && equalFoldASCIIBytes(s[pos:pos+nlen], needle) {
+		start := index - minLen + 1
+		for _, needle := range matcher.endBuckets[lower] {
+			if end := start + len(needle); end <= len(value) && equalFoldASCIIBytes(value[start:end], needle) {
 				return true
 			}
 		}
-		i++
+		index++
 	}
 	return false
 }
 
-// equalFoldASCIIBytes compares two equal-length strings case-insensitively
-// (ASCII only). The second argument (b) must already be lowercase.
-func equalFoldASCIIBytes(a, b string) bool {
-	for i := 0; i < len(a); i++ {
-		ac := a[i]
-		if ac >= 'A' && ac <= 'Z' {
-			ac += 'a' - 'A'
+func equalFoldASCIIBytes(value, lower string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
 		}
-		if ac != b[i] {
+		if c != lower[i] {
 			return false
 		}
 	}
 	return true
+}
+
+func lowerASCII(value string) string {
+	for index := range len(value) {
+		if value[index] < 'A' || value[index] > 'Z' {
+			continue
+		}
+		lower := []byte(value)
+		for offset := index; offset < len(lower); offset++ {
+			if lower[offset] >= 'A' && lower[offset] <= 'Z' {
+				lower[offset] += 'a' - 'A'
+			}
+		}
+		return string(lower)
+	}
+	return value
 }
 
 // containsFoldASCII does a case-insensitive substring check.
@@ -1156,10 +1015,35 @@ func containsFoldASCII(s, needle string) bool {
 	return true
 }
 
-// isASCII reports whether s contains only ASCII bytes.
+const asciiWordSize = 4 << (^uintptr(0) >> 63)
+const asciiHighBits = 0x8080808080808080 >> (64 - 8*asciiWordSize)
+
+func asciiWord(s string) uintptr {
+	if asciiWordSize == 4 {
+		return uintptr(s[0]) | uintptr(s[1])<<8 | uintptr(s[2])<<16 | uintptr(s[3])<<24
+	}
+	return uintptr(uint64(s[0]) | uint64(s[1])<<8 | uint64(s[2])<<16 | uint64(s[3])<<24 |
+		uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56)
+}
+
+// isASCII reports whether s contains only ASCII bytes. Word-sized loads share
+// one high-bit check because this function also guards large regex inputs.
 func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > unicode.MaxASCII {
+	for len(s) >= 4*asciiWordSize {
+		if (asciiWord(s)|asciiWord(s[asciiWordSize:])|
+			asciiWord(s[2*asciiWordSize:])|asciiWord(s[3*asciiWordSize:]))&asciiHighBits != 0 {
+			return false
+		}
+		s = s[4*asciiWordSize:]
+	}
+	for len(s) >= asciiWordSize {
+		if asciiWord(s)&asciiHighBits != 0 {
+			return false
+		}
+		s = s[asciiWordSize:]
+	}
+	for index := range len(s) {
+		if s[index] > unicode.MaxASCII {
 			return false
 		}
 	}
@@ -1175,250 +1059,138 @@ func allASCIIStrings(ss []string) bool {
 	return true
 }
 
-// containsFoldASCIIOnly is a case-insensitive substring search for ASCII-only
-// needles. needle must already be lowercase.
-//
-// It uses strings.IndexByte — which the Go runtime maps to a SIMD instruction
-// on amd64/arm64 — to jump straight to candidate positions (bytes that match
-// the first byte of the needle in either case), then verifies the full needle
-// at those positions. This is significantly faster than a byte-by-byte loop
-// for typical WAF haystack sizes (50–2000 bytes).
+// containsFoldASCIIOnly is a brute-force case-insensitive substring search
+// optimized for ASCII-only needles. It lowercases each byte of s inline
+// (only A-Z → a-z) and compares against needle which must already be lowercase.
+// This avoids allocating a lowercased copy of s.
 func containsFoldASCIIOnly(s, needle string) bool {
 	nlen := len(needle)
-	limit := len(s) - nlen
-	if limit < 0 {
+	if nlen == 0 {
+		return true
+	}
+	lastStart := len(s) - nlen
+	if lastStart < 0 {
 		return false
 	}
-
-	first := needle[0] // already lowercase
-	var upper byte
-	hasUpper := first >= 'a' && first <= 'z'
-	if hasUpper {
-		upper = first - ('a' - 'A')
+	anchorOffset := 0
+	for index := 1; index < len(needle); index++ {
+		if byteRarity(needle[index]) > byteRarity(needle[anchorOffset]) {
+			anchorOffset = index
+		}
 	}
-
-	for i := 0; i <= limit; {
-		// strings.IndexByte is accelerated by the Go runtime (SIMD on
-		// amd64/arm64, scalar elsewhere) and is correct on every platform.
-		lo := strings.IndexByte(s[i:], first)
-		if hasUpper {
-			hi := strings.IndexByte(s[i:], upper)
-			if hi >= 0 && (lo < 0 || hi < lo) {
-				lo = hi
+	lower := needle[anchorOffset]
+	upper := lower
+	if upper >= 'a' && upper <= 'z' {
+		upper -= 'a' - 'A'
+	}
+	for searchStart, lastAnchor := anchorOffset, lastStart+anchorOffset; searchStart <= lastAnchor; {
+		candidates := s[searchStart : lastAnchor+1]
+		next := strings.IndexByte(candidates, lower)
+		if upper != lower {
+			upperNext := strings.IndexByte(candidates, upper)
+			if next < 0 || upperNext >= 0 && upperNext < next {
+				next = upperNext
 			}
 		}
-		if lo < 0 {
+		if next < 0 {
 			return false
 		}
-		i += lo
-		if i > limit {
-			return false
-		}
-		if equalFoldASCIIBytes(s[i:i+nlen], needle) {
+		anchor := searchStart + next
+		candidate := anchor - anchorOffset
+		if equalFoldASCIIBytes(s[candidate:candidate+nlen], needle) {
 			return true
 		}
-		i++
+		searchStart = anchor + 1
 	}
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// Anchor helpers (Gap 1)
-// ---------------------------------------------------------------------------
+type foldedLiteralMatcher struct {
+	needle      string
+	shift       [256]uint16
+	anchorLower byte
+	anchorUpper byte
+	indexed     bool
+}
 
-// hasAnchoredLiteralPrefix reports whether literal is the first consuming
-// expression immediately after an absolute beginning anchor. Merely having an
-// anchor somewhere before the first extracted literal is insufficient: for
-// example, `^.00` is anchored but "00" starts at byte one, not byte zero.
-func hasAnchoredLiteralPrefix(re *syntax.Regexp, literal string, ci bool) bool {
-	for re.Op == syntax.OpCapture {
-		re = re.Sub[0]
+func newFoldedLiteralMatchers(needles []string) []*foldedLiteralMatcher {
+	matchers := make([]*foldedLiteralMatcher, len(needles))
+	for index, needle := range needles {
+		matchers[index] = newFoldedLiteralMatcher(needle)
 	}
-	if literal == "" || re.Op != syntax.OpConcat || len(re.Sub) < 2 || re.Sub[0].Op != syntax.OpBeginText {
+	return matchers
+}
+
+func newFoldedLiteralMatcher(needle string) *foldedLiteralMatcher {
+	matcher := &foldedLiteralMatcher{needle: needle}
+	if len(needle) < 2 || !isASCII(needle) {
+		return matcher
+	}
+	anchor := 0
+	for index := 1; index < len(needle); index++ {
+		if byteRarity(needle[index]) > byteRarity(needle[anchor]) {
+			anchor = index
+		}
+	}
+	matcher.anchorLower = needle[anchor]
+	matcher.anchorUpper = matcher.anchorLower
+	if matcher.anchorUpper >= 'a' && matcher.anchorUpper <= 'z' {
+		matcher.anchorUpper -= 'a' - 'A'
+	}
+	defaultShift := len(needle)
+	if defaultShift > int(^uint16(0)) {
+		defaultShift = int(^uint16(0))
+	}
+	for index := range matcher.shift {
+		matcher.shift[index] = uint16(defaultShift)
+	}
+	for index := 0; index < len(needle)-1; index++ {
+		shift := len(needle) - 1 - index
+		if shift > int(^uint16(0)) {
+			shift = int(^uint16(0))
+		}
+		lower := needle[index]
+		if lower >= 'A' && lower <= 'Z' {
+			lower += 'a' - 'A'
+		}
+		if uint16(shift) < matcher.shift[lower] {
+			matcher.shift[lower] = uint16(shift)
+		}
+		if lower >= 'a' && lower <= 'z' {
+			matcher.shift[lower-('a'-'A')] = matcher.shift[lower]
+		}
+	}
+	matcher.indexed = true
+	return matcher
+}
+
+func (matcher *foldedLiteralMatcher) match(value string) bool {
+	if !matcher.indexed {
+		return containsFoldASCII(value, matcher.needle)
+	}
+	if strings.IndexByte(value, matcher.anchorLower) < 0 &&
+		(matcher.anchorUpper == matcher.anchorLower || strings.IndexByte(value, matcher.anchorUpper) < 0) {
 		return false
 	}
-	return immediateLiteral(re.Sub[1], ci) == literal
-}
-
-// hasAnchoredLiteralSuffix reports whether literal is the last consuming
-// expression immediately before an absolute ending anchor. A wildcard or
-// another consuming expression between them makes a suffix check unsound.
-func hasAnchoredLiteralSuffix(re *syntax.Regexp, literal string, ci bool) bool {
-	for re.Op == syntax.OpCapture {
-		re = re.Sub[0]
-	}
-	last := len(re.Sub) - 1
-	if literal == "" || re.Op != syntax.OpConcat || last < 1 || re.Sub[last].Op != syntax.OpEndText {
-		return false
-	}
-	return immediateLiteral(re.Sub[last-1], ci) == literal
-}
-
-func immediateLiteral(re *syntax.Regexp, ci bool) string {
-	for re.Op == syntax.OpCapture {
-		re = re.Sub[0]
-	}
-	return rawLiteral(re, ci)
-}
-
-// hasPrefixFoldASCII reports whether s begins with prefix (ASCII case-insensitive).
-// prefix must already be lowercase.
-func hasPrefixFoldASCII(s, prefix string) bool {
-	if len(s) < len(prefix) {
-		return false
-	}
-	return equalFoldASCIIBytes(s[:len(prefix)], prefix)
-}
-
-// hasSuffixFoldASCII reports whether s ends with suffix (ASCII case-insensitive).
-// suffix must already be lowercase.
-func hasSuffixFoldASCII(s, suffix string) bool {
-	if len(s) < len(suffix) {
-		return false
-	}
-	return equalFoldASCIIBytes(s[len(s)-len(suffix):], suffix)
-}
-
-// buildMultiNeedlePF builds a prefilter function for an ordered set of needles.
-// needles must already be lowercase when ci is true.
-//
-// usePrefix: needles[0] must appear at position 0 (pattern is start-anchored).
-// useSuffix: needles[last] must appear at the very end of the input.
-//
-// When neither anchor is set, the caller should sort needles longest-first
-// before calling so the most selective literal is checked first.
-func buildMultiNeedlePF(needles []string, ci, usePrefix, useSuffix bool) func(string) bool {
-	if len(needles) == 0 {
-		return nil
-	}
-
-	// Partition into prefix, middle, and suffix segments.
-	var prefix, suffix string
-	middle := needles
-
-	switch {
-	case usePrefix && useSuffix && len(needles) >= 2:
-		prefix = needles[0]
-		suffix = needles[len(needles)-1]
-		middle = needles[1 : len(needles)-1]
-	case usePrefix && useSuffix:
-		// Single needle: only prefix check (exact-match is handled by Gap 2).
-		prefix = needles[0]
-		middle = nil
-	case usePrefix:
-		prefix = needles[0]
-		middle = needles[1:]
-	case useSuffix:
-		suffix = needles[len(needles)-1]
-		middle = needles[:len(needles)-1]
-	}
-
-	if ci {
-		return func(s string) bool {
-			if prefix != "" && !hasPrefixFoldASCII(s, prefix) {
-				return false
-			}
-			if suffix != "" && !hasSuffixFoldASCII(s, suffix) {
-				return false
-			}
-			for _, needle := range middle {
-				if !containsFoldASCII(s, needle) {
-					return false
-				}
-			}
+	needleLen := len(matcher.needle)
+	for end := needleLen - 1; end < len(value); {
+		start := end - needleLen + 1
+		if equalFoldASCIIBytes(value[start:end+1], matcher.needle) {
 			return true
 		}
+		current := value[end]
+		if current >= 'A' && current <= 'Z' {
+			current += 'a' - 'A'
+		}
+		end += int(matcher.shift[current])
 	}
-	return func(s string) bool {
-		if prefix != "" && !strings.HasPrefix(s, prefix) {
-			return false
-		}
-		if suffix != "" && !strings.HasSuffix(s, suffix) {
-			return false
-		}
-		for _, needle := range middle {
-			if !strings.Contains(s, needle) {
-				return false
-			}
-		}
-		return true
-	}
+	return false
 }
 
-// buildCombinedPF builds a prefilter that enforces both allRequired and
-// anyRequired constraints. Both are necessary conditions; combining them
-// produces a strictly more selective check.
-//
-// The outer prefilterFunc wrappers (MML guard, CI isASCII guard) are applied
-// after this function returns — do NOT add them here.
-func buildCombinedPF(v combinedRequired, ci bool, re *syntax.Regexp) func(string) bool {
-	// Build allRequired part.
-	allSlice := []string(v.all)
-	origFirst := ""
-	if len(allSlice) > 0 {
-		origFirst = allSlice[0]
-	}
-	origLast := ""
-	if len(allSlice) > 0 {
-		origLast = allSlice[len(allSlice)-1]
-	}
-	filteredAll := filterShort(allSlice, 2)
-
-	var allPF func(string) bool
-	if len(filteredAll) > 0 {
-		usePrefix := hasAnchoredLiteralPrefix(re, origFirst, ci)
-		useSuffix := hasAnchoredLiteralSuffix(re, origLast, ci)
-		if !usePrefix && !useSuffix {
-			slices.SortFunc(filteredAll, func(a, b string) int { return len(b) - len(a) })
-		}
-		allPF = buildMultiNeedlePF(filteredAll, ci, usePrefix, useSuffix)
-	}
-
-	// Build anyRequired part (same logic as the anyRequired case in prefilterFunc).
-	filteredAny := v.any
-	if ci && !allASCIIStrings([]string(filteredAny)) {
-		// Non-ASCII needles in CI mode: unsafe, fall back to allRequired only.
-		return allPF
-	}
-
-	var anyPF func(string) bool
-	switch {
-	case len(filteredAny) == 1:
-		needle := filteredAny[0]
-		if ci {
-			anyPF = func(s string) bool { return containsFoldASCII(s, needle) }
-		} else {
-			anyPF = func(s string) bool { return strings.Contains(s, needle) }
-		}
-	case len(filteredAny) <= anyRequiredMaxN:
-		im := newIndexedMatcher(filteredAny, ci)
-		anyPF = im.match
-	default:
-		// Too many needles: use allRequired only.
-		return allPF
-	}
-
-	if allPF == nil {
-		return anyPF
-	}
-	outerPF := allPF
-	return func(s string) bool { return outerPF(s) && anyPF(s) }
-}
-
-// ---------------------------------------------------------------------------
-// Exact-match extraction (Gap 2, used by rx.go)
-// ---------------------------------------------------------------------------
-
-// extractExactMatch reports whether re is a pure literal equality check of the
-// form ^literal$ (or \Aliteral\z, or (?i)^literal$). Returns the literal and
-// whether matching is case-insensitive.
-//
-// Only OpBeginText (\A) and OpEndText (\z) are accepted. OpBeginLine and
-// OpEndLine (^ and $ under (?m)) are NOT — the caller is expected to have
-// parsed the original rule pattern without the (?m) flag (i.e. options.Arguments,
-// not the (?sm)-wrapped data string from newRX).
-func extractExactMatch(re *syntax.Regexp) (lit string, ci bool) {
-	// Unwrap outer captures that regexp/syntax sometimes emits.
+// extractExactMatch reports whether re is a pure anchored literal equality
+// check. The caller parses the original rule expression without Coraza's
+// default multiline wrapper so line anchors retain their original meaning.
+func extractExactMatch(re *syntax.Regexp) (literal string, caseInsensitive bool) {
 	for re.Op == syntax.OpCapture {
 		re = re.Sub[0]
 	}
@@ -1426,10 +1198,7 @@ func extractExactMatch(re *syntax.Regexp) (lit string, ci bool) {
 		return "", false
 	}
 	begin, middle, end := re.Sub[0], re.Sub[1], re.Sub[2]
-	if begin.Op != syntax.OpBeginText || end.Op != syntax.OpEndText {
-		return "", false
-	}
-	if middle.Op != syntax.OpLiteral {
+	if begin.Op != syntax.OpBeginText || end.Op != syntax.OpEndText || middle.Op != syntax.OpLiteral {
 		return "", false
 	}
 	for _, r := range middle.Rune {

@@ -6,7 +6,7 @@ package operators
 import (
 	"testing"
 
-	"github.com/corazawaf/libinjection-go"
+	"github.com/ZionOVO/libinjection-go"
 
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
 )
