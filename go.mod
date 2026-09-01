@@ -18,7 +18,7 @@ go 1.25.0
 // - go-re2
 
 require (
-	github.com/ZionOVO/libinjection-go v0.3.3-0.20260831081844-f15e7b4112de
+	github.com/ZionOVO/libinjection-go v0.3.3-zion.1
 	github.com/anuraaga/go-modsecurity v0.0.0-20220824035035-b9a4099778df
 	github.com/corazawaf/coraza-coreruleset v0.0.0-20240226094324-415b1017abdc
 	github.com/corazawaf/coraza-coreruleset/v4 v4.25.0
