@@ -1,5 +1,5 @@
-github.com/ZionOVO/libinjection-go v0.3.3-0.20260831081844-f15e7b4112de h1:pxxUTfHywjEtne1BJUbN04mKk3Hekcoodgm2vs5Jt4w=
-github.com/ZionOVO/libinjection-go v0.3.3-0.20260831081844-f15e7b4112de/go.mod h1:LcwSODlshnkwslLowDpSvbpinckA9x+xkpG/fQXmYbo=
+github.com/ZionOVO/libinjection-go v0.3.3-zion.1 h1:eEOokz1igGNb4jixm6/kpA+seBnEqxR9hB0hrrOgfn8=
+github.com/ZionOVO/libinjection-go v0.3.3-zion.1/go.mod h1:LcwSODlshnkwslLowDpSvbpinckA9x+xkpG/fQXmYbo=
 github.com/anuraaga/go-modsecurity v0.0.0-20220824035035-b9a4099778df h1:YWiVl53v0R8Knj/k+4slO0SXPL67Y4dXWiOIWNzrkew=
 github.com/anuraaga/go-modsecurity v0.0.0-20220824035035-b9a4099778df/go.mod h1:7jguE759ADzy2EkxGRXigiC0ER1Yq2IFk2qNtwgzc7U=
 github.com/corazawaf/coraza-coreruleset v0.0.0-20240226094324-415b1017abdc h1:OlJhrgI3I+FLUCTI3JJW8MoqyM78WbqJjecqMnqG+wc=
