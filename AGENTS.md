@@ -100,6 +100,14 @@ when the test module actually needs the change, and run its tests separately.
   redirect the canonical module. Do not change the module path as part of a
   patch release. Publish a first-class public Go module only after deliberately
   adopting a new module path and versioning policy.
+- A fork tag with that unchanged `go.mod` path may appear in the proxy's
+  version list but still return 404 for its `.mod`/`.zip` or checksum lookup
+  under the fork owner. Treat this as module-path identity behavior, not as a
+  release-indexing delay. Test the exact consumer setup (for example, a
+  canonical-path `require` plus an explicit fork `replace`, with a local or
+  direct source when checksum lookup is unavailable). Scope any
+  `GONOSUMDB`/`GOPROXY=direct` exception to the fork path; never disable module
+  verification globally.
 - Publish dependency releases first, then update Coraza, then tag Coraza. Do
   not tag a Coraza commit that still depends on an unpublished pseudo-version.
 - Prefer signed annotated tags. If signing is unavailable, record that the tag
